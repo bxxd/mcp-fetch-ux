@@ -1,28 +1,59 @@
 #!/usr/bin/env bash
-# Quick test CLI — fetch a URL directly (no MCP server needed)
+# Fetch a URL with optional actions
+#
+# Usage:
+#   ./cli <url>                                    # basic fetch
+#   ./cli <url> --click "text=Download CSV"        # click then capture
+#   ./cli <url> --click "#btn" --fill "input=val"  # multiple actions
+#   ./cli <url> --max 20000                        # more content
+#   ./cli <url> --raw                              # raw HTML
 set -euo pipefail
 cd "$(dirname "$0")"
 
-URL="${1:?Usage: ./cli <url> [max_length]}"
-MAX_LENGTH="${2:-5000}"
+URL=""
+MAX_LENGTH=5000
+START_INDEX=0
+RAW=False
+ACTIONS="[]"
+
+action_list=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --click)  action_list+=("{\"action\":\"click\",\"selector\":\"$2\"}"); shift 2 ;;
+        --fill)   sel="${2%%=*}"; val="${2#*=}"; action_list+=("{\"action\":\"fill\",\"selector\":\"$sel\",\"value\":\"$val\"}"); shift 2 ;;
+        --wait)
+            if [[ "$2" =~ ^[0-9]+$ ]]; then action_list+=("{\"action\":\"wait\",\"timeout\":$2}")
+            else action_list+=("{\"action\":\"wait\",\"selector\":\"$2\"}"); fi
+            shift 2 ;;
+        --scroll) action_list+=("{\"action\":\"scroll\",\"direction\":\"${2:-bottom}\"}"); shift 2 ;;
+        --max)    MAX_LENGTH="$2"; shift 2 ;;
+        --start)  START_INDEX="$2"; shift 2 ;;
+        --raw)    RAW=True; shift ;;
+        *)        URL="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$URL" ]]; then
+    echo "Usage: ./cli <url> [--click selector] [--fill selector=value] [--wait selector|ms] [--max N] [--raw]"
+    exit 1
+fi
+
+if [[ ${#action_list[@]} -gt 0 ]]; then
+    ACTIONS="[$(IFS=,; echo "${action_list[*]}")]"
+fi
+
+ACTIONS_B64=$(echo -n "$ACTIONS" | base64 -w0)
+URL_B64=$(echo -n "$URL" | base64 -w0)
 
 poetry run python3 -c "
-import asyncio
-from fetch_ux import FetchClient
+import asyncio, json, base64
+from mcp_fetch_ux.handlers import handle_fetch
 
 async def main():
-    client = FetchClient()
-    await client.start()
-    try:
-        result = await client.fetch('$URL', max_length=$MAX_LENGTH)
-        if result.title:
-            print(f'Title: {result.title}')
-            print(f'Length: {result.length} chars')
-            print(f'Truncated: {result.truncated}')
-            print('---')
-        print(result.content)
-    finally:
-        await client.stop()
+    actions = json.loads(base64.b64decode('$ACTIONS_B64').decode()) or None
+    url = base64.b64decode('$URL_B64').decode()
+    result = await handle_fetch(url=url, actions=actions, max_length=$MAX_LENGTH, start_index=$START_INDEX, raw=$RAW)
+    print(result)
 
 asyncio.run(main())
 "

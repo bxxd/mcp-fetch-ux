@@ -25,6 +25,7 @@ class FetchResult:
     truncated: bool
     status: int = 200
     download_filename: str | None = None
+    actions_available: list[str] | None = None
 
 
 def extract_content_from_html(html: str) -> tuple[str, str]:
@@ -179,6 +180,9 @@ class FetchClient:
                     await page.keyboard.press("Control+c")
                     text = await page.evaluate("navigator.clipboard.readText()")
                 content = text
+
+            # Discover available actions on the page
+            actions_available = await self._discover_actions(page)
         finally:
             await context.close()
 
@@ -207,7 +211,67 @@ class FetchClient:
             truncated=truncated,
             status=status,
             download_filename=download_filename,
+            actions_available=actions_available if actions_available else None,
         )
+
+    async def _discover_actions(self, page) -> list[str]:
+        """Find interactive elements on the page the agent can use."""
+        try:
+            return await page.evaluate("""() => {
+                const actions = [];
+                const seen = new Set();
+
+                // Helper to add unique action
+                function add(action) {
+                    if (!seen.has(action) && action.length < 200) {
+                        seen.add(action);
+                        actions.push(action);
+                    }
+                }
+
+                // Buttons with visible text
+                document.querySelectorAll('button').forEach(el => {
+                    const text = el.textContent?.trim();
+                    if (text && text.length > 1 && text.length < 80 && el.offsetParent !== null) {
+                        add('click: "button:has-text(\\'' + text.replace(/'/g, "\\\\'") + '\\')"');
+                    }
+                });
+
+                // Links with text (not nav/footer)
+                document.querySelectorAll('a[href]').forEach(el => {
+                    const text = el.textContent?.trim();
+                    if (text && text.length > 1 && text.length < 80 && el.offsetParent !== null) {
+                        const href = el.getAttribute('href');
+                        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+                            add('click: "a:has-text(\\'' + text.replace(/'/g, "\\\\'") + '\\')" → ' + href.substring(0, 80));
+                        }
+                    }
+                });
+
+                // Download links
+                document.querySelectorAll('a[download], a[href$=".csv"], a[href$=".pdf"], a[href$=".xlsx"]').forEach(el => {
+                    const text = el.textContent?.trim() || el.getAttribute('download') || el.href;
+                    add('download: "' + text + '"');
+                });
+
+                // Input fields
+                document.querySelectorAll('input:not([type=hidden]), textarea, select').forEach(el => {
+                    const name = el.name || el.id || el.getAttribute('aria-label') || el.type;
+                    if (name && el.offsetParent !== null) {
+                        const tag = el.tagName.toLowerCase();
+                        if (tag === 'select') {
+                            const opts = Array.from(el.options).slice(0, 5).map(o => o.text).join(', ');
+                            add('select: "' + name + '" options=[' + opts + ']');
+                        } else {
+                            add('fill: "' + name + '" (' + (el.type || tag) + ')');
+                        }
+                    }
+                });
+
+                return actions.slice(0, 20);  // Cap at 20 to keep output reasonable
+            }""")
+        except Exception:
+            return []
 
     async def _dismiss_overlays(self, page):
         """Dismiss cookie/consent overlays blocking interaction."""

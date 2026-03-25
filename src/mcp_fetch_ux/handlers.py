@@ -77,4 +77,11 @@ async def handle_fetch(
     lines.append("")
     lines.append(result.content)
 
+    if result.actions_available:
+        lines.append("")
+        lines.append("---")
+        lines.append("Available actions on this page:")
+        for a in result.actions_available:
+            lines.append(f"  - {a}")
+
     return "\n".join(lines)
