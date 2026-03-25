@@ -33,10 +33,12 @@ class FetchResult:
 BINARY_EXTENSIONS = {".pdf", ".pptx", ".xlsx", ".xls", ".docx", ".doc", ".zip", ".gz", ".tar", ".png", ".jpg", ".gif"}
 
 
-def _read_download(path: str, filename: str | None) -> str:
+def _read_download(path: str, filename: str | None, url: str | None = None) -> str:
     """Read downloaded file, converting binary formats to text where possible."""
     p = Path(path)
     ext = Path(filename).suffix.lower() if filename else p.suffix.lower()
+    size = p.stat().st_size
+    curl_hint = f"\n\nTo save locally: curl -sL -o {filename} '{url}'" if url else ""
 
     if ext == ".pdf":
         try:
@@ -48,10 +50,10 @@ def _read_download(path: str, filename: str | None) -> str:
                 return result.stdout.decode("utf-8", errors="replace")
         except Exception as e:
             logger.warning(f"pdftotext failed: {e}")
-        return f"[Binary PDF file: {filename} ({p.stat().st_size} bytes) — pdftotext conversion failed]"
+        return f"[Binary PDF: {filename} ({size} bytes) — pdftotext failed]{curl_hint}"
 
     if ext in BINARY_EXTENSIONS:
-        return f"[Binary file: {filename} ({p.stat().st_size} bytes) — cannot extract text]"
+        return f"[Binary file: {filename} ({size} bytes) — use curl to download]{curl_hint}"
 
     # Text-like file (csv, txt, json, xml, html, etc.)
     with open(p, "r", errors="replace") as f:
@@ -194,7 +196,8 @@ class FetchClient:
                 path = await download_file.path()
                 download_filename = download_file.suggested_filename
                 if path:
-                    download_content = _read_download(path, download_filename)
+                    download_url = download_file.url or url
+                    download_content = _read_download(path, download_filename, download_url)
 
             title = await page.title()
 
