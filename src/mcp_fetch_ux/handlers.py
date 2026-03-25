@@ -35,16 +35,18 @@ async def call_tool(name: str, arguments: dict) -> str:
 
 async def handle_fetch(
     url: str,
+    actions: list[dict] | None = None,
     max_length: int = 5000,
     start_index: int = 0,
     raw: bool = False,
 ) -> str:
-    """Fetch URL with Playwright, extract with Readability, return markdown."""
+    """Fetch URL with Playwright, optionally interact, return content."""
     client = await get_client()
 
     start = time.time()
     result = await client.fetch(
         url=url,
+        actions=actions,
         max_length=max_length,
         start_index=start_index,
         raw=raw,
@@ -52,7 +54,9 @@ async def handle_fetch(
     elapsed = time.time() - start
 
     logger.info(
-        f"fetch url={url} status={result.status} title={result.title!r} "
+        f"fetch url={url} status={result.status} "
+        f"{'download=' + result.download_filename + ' ' if result.download_filename else ''}"
+        f"title={result.title!r} "
         f"length={result.length} truncated={result.truncated} "
         f"time={elapsed:.1f}s"
     )
@@ -63,9 +67,13 @@ async def handle_fetch(
     if not result.content:
         return f"No content extracted from {url}"
 
-    lines = [f"Contents of {url}:"]
-    if result.title:
-        lines.append(f"Title: {result.title}")
+    lines = []
+    if result.download_filename:
+        lines.append(f"Downloaded: {result.download_filename} ({result.length} chars)")
+    else:
+        lines.append(f"Contents of {url}:")
+        if result.title:
+            lines.append(f"Title: {result.title}")
     lines.append("")
     lines.append(result.content)
 

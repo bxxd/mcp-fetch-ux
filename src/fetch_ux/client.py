@@ -1,15 +1,19 @@
-"""Playwright-based web fetcher with Readability extraction.
+"""Playwright-based web fetcher with clipboard extraction.
 
-Renders JS, extracts visible article content, returns markdown.
+Renders JS, captures visible text (including Shadow DOM) via Ctrl+A/Ctrl+C.
+Supports page interactions (click, fill, wait) and file downloads.
 30s timeout. No LLM. No cost.
 """
 
 import asyncio
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 
 import markdownify
 import readabilipy.simple_json
-from playwright.async_api import async_playwright, Browser
+from playwright.async_api import async_playwright, Browser, Download
+
+logger = logging.getLogger("fetch_ux")
 
 
 @dataclass
@@ -20,13 +24,11 @@ class FetchResult:
     length: int
     truncated: bool
     status: int = 200
+    download_filename: str | None = None
 
 
 def extract_content_from_html(html: str) -> tuple[str, str]:
-    """Extract article content from HTML using Readability, convert to markdown.
-
-    Returns (markdown_content, title).
-    """
+    """Extract article content from HTML using Readability, convert to markdown."""
     ret = readabilipy.simple_json.simple_json_from_html_string(
         html, use_readability=True
     )
@@ -41,7 +43,7 @@ def extract_content_from_html(html: str) -> tuple[str, str]:
 
 
 class FetchClient:
-    """Fetches URLs with Playwright (JS rendering) + Readability (content extraction)."""
+    """Fetches URLs with Playwright (JS rendering) + clipboard extraction."""
 
     def __init__(self, timeout_ms: int = 30_000, user_agent: str | None = None):
         self.timeout_ms = timeout_ms
@@ -51,7 +53,7 @@ class FetchClient:
         )
         self._browser: Browser | None = None
         self._pw = None
-        self._semaphore = asyncio.Semaphore(3)  # max 3 concurrent fetches
+        self._semaphore = asyncio.Semaphore(3)
 
     async def start(self):
         """Launch browser. Call once at server startup."""
@@ -71,27 +73,30 @@ class FetchClient:
     async def fetch(
         self,
         url: str,
+        actions: list[dict] | None = None,
         max_length: int = 5000,
         start_index: int = 0,
         raw: bool = False,
     ) -> FetchResult:
-        """Fetch URL, render JS, extract content as markdown.
+        """Fetch URL, render JS, optionally interact, extract content.
 
         Args:
             url: URL to fetch.
+            actions: List of actions to perform before capturing.
             max_length: Max chars to return per call.
-            start_index: Start content extraction at this char index (for pagination).
-            raw: Return raw HTML instead of Readability-extracted markdown.
+            start_index: Start content extraction at this char index.
+            raw: Return raw HTML instead of clipboard text.
         """
         if not self._browser:
             await self.start()
 
         async with self._semaphore:
-            return await self._fetch_impl(url, max_length, start_index, raw)
+            return await self._fetch_impl(url, actions, max_length, start_index, raw)
 
     async def _fetch_impl(
         self,
         url: str,
+        actions: list[dict] | None,
         max_length: int,
         start_index: int,
         raw: bool,
@@ -100,45 +105,41 @@ class FetchClient:
             user_agent=self.user_agent,
             viewport={"width": 1280, "height": 720},
             permissions=["clipboard-read", "clipboard-write"],
+            accept_downloads=True,
         )
         context.set_default_timeout(self.timeout_ms)
 
+        download_file: Download | None = None
+        download_content: str | None = None
+
         try:
             page = await context.new_page()
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+
+            # Listen for downloads
+            page.on("download", lambda d: _capture_download(d))
+
+            def _capture_download(d: Download):
+                nonlocal download_file
+                download_file = d
+
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=self.timeout_ms
+            )
             status = response.status if response else 0
 
-            # Dismiss cookie/consent overlays that may block content
-            for selector in [
-                "button:has-text('Accept')",
-                "button:has-text('Accept All')",
-                "button:has-text('OK')",
-                "button:has-text('I Agree')",
-                "[id*='cookie'] button",
-                "[class*='cookie'] button",
-                "[id*='consent'] button",
-            ]:
-                try:
-                    btn = page.locator(selector).first
-                    if await btn.is_visible(timeout=500):
-                        await btn.click()
-                        await page.wait_for_timeout(500)
-                        break
-                except Exception:
-                    continue
+            await self._dismiss_overlays(page)
 
-            # Wait for JS content to render: poll clipboard text until stable
-            # Require 2 consecutive stable readings after at least 1s
+            # Wait for JS content to render
             text = ""
             prev_len = 0
             stable_count = 0
-            for i in range(12):  # max 6s (12 × 500ms)
+            for i in range(12):
                 await page.wait_for_timeout(500)
                 await page.keyboard.press("Control+a")
                 await page.keyboard.press("Control+c")
                 text = await page.evaluate("navigator.clipboard.readText()")
                 cur_len = len(text)
-                if cur_len == prev_len and i >= 2:  # stable after at least 1s
+                if cur_len == prev_len and i >= 2:
                     stable_count += 1
                     if stable_count >= 2:
                         break
@@ -146,12 +147,37 @@ class FetchClient:
                     stable_count = 0
                 prev_len = cur_len
 
+            # Run actions
+            if actions:
+                # Dismiss any overlays that appeared after content load
+                await self._dismiss_overlays(page)
+                for act in actions:
+                    await self._run_action(page, act)
+                    # Check if a download was triggered
+                    if download_file:
+                        break
+
+            # If a download was triggered, read its content
+            download_filename = None
+            if download_file:
+                path = await download_file.path()
+                download_filename = download_file.suggested_filename
+                if path:
+                    with open(path, "r", errors="replace") as f:
+                        download_content = f.read()
+
             title = await page.title()
 
-            if raw:
+            if download_content is not None:
+                content = download_content
+            elif raw:
                 content = await page.content()
             else:
-                # Already captured via clipboard polling above
+                # Re-capture clipboard after actions (content may have changed)
+                if actions:
+                    await page.keyboard.press("Control+a")
+                    await page.keyboard.press("Control+c")
+                    text = await page.evaluate("navigator.clipboard.readText()")
                 content = text
         finally:
             await context.close()
@@ -180,4 +206,89 @@ class FetchClient:
             length=original_length,
             truncated=truncated,
             status=status,
+            download_filename=download_filename,
         )
+
+    async def _dismiss_overlays(self, page):
+        """Dismiss cookie/consent overlays blocking interaction."""
+        for selector in [
+            "#onetrust-reject-all-handler",
+            "#onetrust-accept-btn-handler",
+            "button:has-text('Accept All')",
+            "button:has-text('Reject All')",
+            "button:has-text('Accept')",
+            "button:has-text('OK')",
+            "button:has-text('I Agree')",
+            "[id*='cookie'] button",
+            "[class*='cookie'] button",
+            "[id*='consent'] button",
+        ]:
+            try:
+                btn = page.locator(selector).first
+                if await btn.is_visible(timeout=300):
+                    await btn.click()
+                    await page.wait_for_timeout(500)
+                    return
+            except Exception:
+                continue
+
+    async def _run_action(self, page, act: dict):
+        """Execute a single page action."""
+        action = act.get("action")
+        selector = act.get("selector")
+        value = act.get("value")
+        timeout = act.get("timeout", 5000)
+
+        if action == "click":
+            if not selector:
+                return
+            try:
+                loc = page.locator(selector).first
+                # Check if click triggers a download
+                try:
+                    async with page.expect_download(timeout=timeout) as dl_info:
+                        await loc.click(timeout=timeout)
+                    # Download was triggered — it's captured by the event listener
+                    return
+                except Exception:
+                    # No download — normal click
+                    await loc.click(timeout=timeout)
+            except Exception as e:
+                logger.warning(f"Action click({selector}) failed: {e}")
+
+        elif action == "fill":
+            if not selector or value is None:
+                return
+            try:
+                await page.locator(selector).first.fill(value, timeout=timeout)
+            except Exception as e:
+                logger.warning(f"Action fill({selector}) failed: {e}")
+
+        elif action == "wait":
+            if selector:
+                try:
+                    await page.locator(selector).first.wait_for(
+                        state="visible", timeout=timeout
+                    )
+                except Exception as e:
+                    logger.warning(f"Action wait({selector}) failed: {e}")
+            else:
+                await page.wait_for_timeout(timeout)
+
+        elif action == "select":
+            if not selector or value is None:
+                return
+            try:
+                await page.locator(selector).first.select_option(
+                    value, timeout=timeout
+                )
+            except Exception as e:
+                logger.warning(f"Action select({selector}) failed: {e}")
+
+        elif action == "scroll":
+            direction = act.get("direction", "bottom")
+            if direction == "bottom":
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            elif direction == "top":
+                await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(500)
