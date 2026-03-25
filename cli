@@ -50,8 +50,10 @@ URL_B64=$(echo -n "$URL" | base64 -w0)
 OUTFILE_B64=$(echo -n "$OUTFILE" | base64 -w0)
 
 poetry run python3 -c "
-import asyncio, json, base64
-from mcp_fetch_ux.handlers import handle_fetch
+import asyncio, json, base64, warnings
+warnings.filterwarnings('ignore')
+
+from mcp_fetch_ux.handlers import handle_fetch, shutdown_client
 
 async def main():
     actions = json.loads(base64.b64decode('$ACTIONS_B64').decode()) or None
@@ -64,6 +66,7 @@ async def main():
         print(f'Wrote {len(result)} chars to {outfile}')
     else:
         print(result)
+    await shutdown_client()
 
 asyncio.run(main())
-"
+" 2>/dev/null
