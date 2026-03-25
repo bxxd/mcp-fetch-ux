@@ -7,7 +7,9 @@ Supports page interactions (click, fill, wait) and file downloads.
 
 import asyncio
 import logging
+import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import markdownify
 import readabilipy.simple_json
@@ -26,6 +28,34 @@ class FetchResult:
     status: int = 200
     download_filename: str | None = None
     actions_available: list[str] | None = None
+
+
+BINARY_EXTENSIONS = {".pdf", ".pptx", ".xlsx", ".xls", ".docx", ".doc", ".zip", ".gz", ".tar", ".png", ".jpg", ".gif"}
+
+
+def _read_download(path: str, filename: str | None) -> str:
+    """Read downloaded file, converting binary formats to text where possible."""
+    p = Path(path)
+    ext = Path(filename).suffix.lower() if filename else p.suffix.lower()
+
+    if ext == ".pdf":
+        try:
+            result = subprocess.run(
+                ["pdftotext", str(p), "-"],
+                capture_output=True, timeout=30,
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning(f"pdftotext failed: {e}")
+        return f"[Binary PDF file: {filename} ({p.stat().st_size} bytes) — pdftotext conversion failed]"
+
+    if ext in BINARY_EXTENSIONS:
+        return f"[Binary file: {filename} ({p.stat().st_size} bytes) — cannot extract text]"
+
+    # Text-like file (csv, txt, json, xml, html, etc.)
+    with open(p, "r", errors="replace") as f:
+        return f.read()
 
 
 def extract_content_from_html(html: str) -> tuple[str, str]:
@@ -164,8 +194,7 @@ class FetchClient:
                 path = await download_file.path()
                 download_filename = download_file.suggested_filename
                 if path:
-                    with open(path, "r", errors="replace") as f:
-                        download_content = f.read()
+                    download_content = _read_download(path, download_filename)
 
             title = await page.title()
 
