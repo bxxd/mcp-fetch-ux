@@ -191,7 +191,7 @@ class FetchClient:
 
         if start_index >= original_length:
             content = ""
-        else:
+        elif max_length > 0:
             chunk = content[start_index : start_index + max_length]
             remaining = original_length - (start_index + len(chunk))
             if remaining > 0 and len(chunk) == max_length:
@@ -202,6 +202,8 @@ class FetchClient:
                     f"Call fetch with start_index={next_start} for more.</truncated>"
                 )
             content = chunk
+        elif start_index > 0:
+            content = content[start_index:]
 
         return FetchResult(
             url=url,

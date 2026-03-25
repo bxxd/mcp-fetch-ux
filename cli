@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 URL=""
-MAX_LENGTH=5000
+MAX_LENGTH=0
 START_INDEX=0
 RAW=False
 OUTFILE=""
