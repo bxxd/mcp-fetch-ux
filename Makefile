@@ -17,8 +17,8 @@ help:
 setup:
 	@echo "→ Installing dependencies..."
 	@poetry install
-	@echo "→ Installing Playwright browsers..."
-	@poetry run playwright install chromium
+	@echo "→ Installing Patchright browsers..."
+	@poetry run patchright install chromium
 	@echo "✓ Setup complete"
 
 install: setup

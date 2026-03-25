@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><title>Long Page</title></head>
+<body>
+<h1>Long Content</h1>
+<script>
+// Generate enough content to test truncation
+const container = document.createElement('div');
+for (let i = 0; i < 200; i++) {
+    const p = document.createElement('p');
+    p.textContent = 'Line ' + i + ': ' + 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '.repeat(3);
+    container.appendChild(p);
+}
+document.body.appendChild(container);
+</script>
+</body>
+</html>

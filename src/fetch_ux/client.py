@@ -7,13 +7,14 @@ Supports page interactions (click, fill, wait) and file downloads.
 
 import asyncio
 import logging
+import random
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import markdownify
 import readabilipy.simple_json
-from playwright.async_api import async_playwright, Browser, Download
+from patchright.async_api import async_playwright, Browser, Download
 
 logger = logging.getLogger("fetch_ux")
 
@@ -81,8 +82,8 @@ class FetchClient:
     def __init__(self, timeout_ms: int = 30_000, user_agent: str | None = None):
         self.timeout_ms = timeout_ms
         self.user_agent = user_agent or (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         )
         self._browser: Browser | None = None
         self._pw = None
@@ -93,7 +94,12 @@ class FetchClient:
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
             headless=True,
-            args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
 
     async def stop(self):
@@ -134,13 +140,74 @@ class FetchClient:
         start_index: int,
         raw: bool,
     ) -> FetchResult:
+        # Randomize viewport slightly — fixed 1280x720 is a bot fingerprint
+        vw = 1280 + random.randint(-40, 40)
+        vh = 720 + random.randint(-30, 30)
+
         context = await self._browser.new_context(
             user_agent=self.user_agent,
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": vw, "height": vh},
+            screen={"width": 1920, "height": 1080},
             permissions=["clipboard-read", "clipboard-write"],
             accept_downloads=True,
+            locale="en-US",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Linux"',
+                "DNT": "1",
+            },
         )
         context.set_default_timeout(self.timeout_ms)
+
+        # Mask headless fingerprints before any page loads
+        await context.add_init_script("""
+            // navigator.webdriver — biggest headless tell
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+            // navigator.plugins — empty in headless
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+
+            // navigator.languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+
+            // window.chrome runtime
+            if (!window.chrome) {
+                window.chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}) };
+            }
+
+            // WebGL — mask SwiftShader
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+                if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Direct3D11 vs_5_0 ps_5_0)';
+                return getParameter.call(this, parameter);
+            };
+
+            // Permissions API — headless returns 'denied' for notifications
+            const originalQuery = window.Permissions?.prototype?.query;
+            if (originalQuery) {
+                window.Permissions.prototype.query = function(parameters) {
+                    if (parameters.name === 'notifications') {
+                        return Promise.resolve({ state: Notification.permission });
+                    }
+                    return originalQuery.call(this, parameters);
+                };
+            }
+
+            // Hardware fingerprints — headless defaults are suspicious
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+            // Screen properties — match the screen size we set on the context
+            Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+            Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+        """)
 
         download_file: Download | None = None
         download_content: str | None = None
@@ -162,12 +229,15 @@ class FetchClient:
 
             await self._dismiss_overlays(page)
 
+            # Small human-like pause after page load
+            await page.wait_for_timeout(random.randint(200, 600))
+
             # Wait for JS content to render
             text = ""
             prev_len = 0
             stable_count = 0
             for i in range(12):
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(random.randint(400, 600))
                 await page.keyboard.press("Control+a")
                 await page.keyboard.press("Control+c")
                 text = await page.evaluate("navigator.clipboard.readText()")
@@ -189,6 +259,8 @@ class FetchClient:
                     # Check if a download was triggered
                     if download_file:
                         break
+                    # Human-like pause between actions
+                    await page.wait_for_timeout(random.randint(100, 400))
 
             # If a download was triggered, read its content
             download_filename = None
@@ -346,6 +418,18 @@ class FetchClient:
                 return
             try:
                 loc = page.locator(selector).first
+                # Human-like: move mouse near target before clicking
+                try:
+                    box = await loc.bounding_box(timeout=timeout)
+                    if box:
+                        await page.mouse.move(
+                            box["x"] + box["width"] * random.uniform(0.2, 0.8),
+                            box["y"] + box["height"] * random.uniform(0.2, 0.8),
+                            steps=random.randint(5, 15),
+                        )
+                        await page.wait_for_timeout(random.randint(50, 200))
+                except Exception:
+                    pass  # Best-effort — proceed to click even if move fails
                 # Check if click triggers a download
                 try:
                     async with page.expect_download(timeout=timeout) as dl_info:

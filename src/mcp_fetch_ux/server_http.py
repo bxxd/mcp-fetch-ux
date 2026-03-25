@@ -1,18 +1,21 @@
-"""HTTP/SSE MCP server for fetch tool."""
+"""HTTP MCP server for fetch tool — streamable HTTP transport (stateless)."""
 
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 
+import anyio
 import uvicorn
 from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
-from mcp.types import TextContent
+from mcp.server.streamable_http import StreamableHTTPServerTransport
+from mcp.types import TextContent, Tool
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Mount, Route
 
 from . import handlers
 from .tools import TOOLS
@@ -39,18 +42,26 @@ def setup_logging():
     root.setLevel(logging.INFO)
 
     # Quiet noisy loggers
-    logging.getLogger("playwright").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("patchright").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 
 
 # MCP server
 mcp_server = Server("mcp-fetch-ux")
+
+# Streamable HTTP — stateless, survives server restarts
+transport = StreamableHTTPServerTransport(
+    mcp_session_id=None,
+    is_json_response_enabled=True,
+)
+
+# SSE — legacy fallback for clients that don't support streamable HTTP
 sse = SseServerTransport("/messages")
 
 
 @mcp_server.list_tools()
 async def list_tools():
-    return TOOLS
+    return [Tool(**t) for t in TOOLS]
 
 
 @mcp_server.call_tool()
@@ -63,23 +74,18 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
-# HTTP routes
-async def handle_sse(request: Request):
+# SSE routes (legacy)
+async def handle_sse(request: Request) -> Response:
     async with sse.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
         await mcp_server.run(
             streams[0], streams[1], mcp_server.create_initialization_options()
         )
-
-    from starlette.responses import Response
-    return Response(headers={"Cache-Control": "no-cache"})
+    return Response()
 
 
-async def handle_messages(request: Request):
-    await sse.handle_post_message(request.scope, request.receive, request._send)
-
-
+# HTTP routes
 async def handle_ping(request: Request):
     return JSONResponse({"status": "ok"})
 
@@ -89,11 +95,21 @@ async def handle_shutdown(request: Request):
     return JSONResponse({"status": "shutdown"})
 
 
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app):
+    """Start MCP server in background, keep transport alive for all requests."""
     logger.info(f"Starting mcp-fetch-ux on port {os.getenv('PORT', '5006')}")
+    async with transport.connect() as (read_stream, write_stream):
+        async with anyio.create_task_group() as tg:
+            async def run_server():
+                await mcp_server.run(
+                    read_stream, write_stream, mcp_server.create_initialization_options(),
+                    stateless=True,
+                )
 
-
-async def on_shutdown():
+            tg.start_soon(run_server)
+            yield
+            tg.cancel_scope.cancel()
     await handlers.shutdown_client()
     logger.info("Server stopped")
 
@@ -101,12 +117,12 @@ async def on_shutdown():
 app = Starlette(
     routes=[
         Route("/ping", handle_ping, methods=["GET"]),
-        Route("/sse", handle_sse, methods=["GET"]),
-        Route("/messages", handle_messages, methods=["POST"]),
+        Mount("/mcp", app=transport.handle_request),
+        Route("/sse", handle_sse),
+        Mount("/messages", app=sse.handle_post_message),
         Route("/shutdown", handle_shutdown, methods=["POST"]),
     ],
-    on_startup=[on_startup],
-    on_shutdown=[on_shutdown],
+    lifespan=lifespan,
 )
 
 

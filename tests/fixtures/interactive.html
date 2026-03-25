@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><title>Interactive Page</title></head>
+<body>
+<h1>Interactive Test</h1>
+<input type="text" name="search" id="search-input" placeholder="Search...">
+<button id="search-btn" onclick="document.getElementById('results').textContent = 'Results for: ' + document.getElementById('search-input').value">Search</button>
+<div id="results"></div>
+<select id="filter" name="filter">
+  <option value="all">All</option>
+  <option value="recent">Recent</option>
+  <option value="popular">Popular</option>
+</select>
+<a href="/simple.html">Simple Page</a>
+<a href="https://example.com/download.csv" download>Download CSV</a>
+</body>
+</html>

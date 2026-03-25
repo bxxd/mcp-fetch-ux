@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><title>Stealth Check</title></head>
+<body>
+<div id="results"></div>
+<script>
+const results = {};
+results.webdriver = navigator.webdriver;
+results.plugins_length = navigator.plugins.length;
+results.languages = JSON.stringify(navigator.languages);
+results.chrome = typeof window.chrome !== 'undefined';
+results.chrome_runtime = typeof window.chrome?.runtime !== 'undefined';
+document.getElementById('results').textContent = JSON.stringify(results);
+</script>
+</body>
+</html>

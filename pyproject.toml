@@ -18,6 +18,7 @@ mcp = "^1.0.0"
 starlette = "^0.41.0"
 uvicorn = "^0.32.0"
 python-dotenv = "^1.0.0"
+patchright = "^1.58.2"
 
 [tool.poetry.group.dev.dependencies]
 ruff = ">=0.7.0"
