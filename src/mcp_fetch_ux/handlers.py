@@ -36,7 +36,7 @@ async def call_tool(name: str, arguments: dict) -> str:
 async def handle_fetch(
     url: str,
     actions: list[dict] | None = None,
-    max_length: int = 5000,
+    max_length: int = 50000,
     start_index: int = 0,
     raw: bool = False,
 ) -> str:

@@ -51,8 +51,8 @@ TOOLS = [
                 },
                 "max_length": {
                     "type": "integer",
-                    "description": "Maximum characters to return. Default 5000.",
-                    "default": 5000,
+                    "description": "Maximum characters to return. Default 50000. Truncates on line boundary.",
+                    "default": 50000,
                 },
                 "start_index": {
                     "type": "integer",

@@ -193,12 +193,16 @@ class FetchClient:
             content = ""
         elif max_length > 0:
             chunk = content[start_index : start_index + max_length]
+            # End on a line boundary
+            last_nl = chunk.rfind("\n")
+            if last_nl > 0 and len(chunk) == max_length:
+                chunk = chunk[: last_nl + 1]
             remaining = original_length - (start_index + len(chunk))
-            if remaining > 0 and len(chunk) == max_length:
+            if remaining > 0:
                 truncated = True
                 next_start = start_index + len(chunk)
                 chunk += (
-                    f"\n\n<truncated>Content truncated. "
+                    f"\n<truncated>Content truncated. "
                     f"Call fetch with start_index={next_start} for more.</truncated>"
                 )
             content = chunk
