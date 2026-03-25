@@ -72,6 +72,9 @@ async def handle_sse(request: Request):
             streams[0], streams[1], mcp_server.create_initialization_options()
         )
 
+    from starlette.responses import Response
+    return Response(headers={"Cache-Control": "no-cache"})
+
 
 async def handle_messages(request: Request):
     await sse.handle_post_message(request.scope, request.receive, request._send)
