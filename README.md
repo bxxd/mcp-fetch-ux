@@ -20,17 +20,26 @@ No LLM in the loop. No API costs. 30-second timeout.
 ```bash
 git clone https://github.com/bxxd/mcp-fetch-ux.git
 cd mcp-fetch-ux
-make setup     # install deps + Chromium
-make server    # start on port 5006
+make install   # install deps + Chromium + 'fetch' CLI to ~/.local/bin/
 ```
 
-Test directly:
 ```bash
 # Basic fetch
-./cli https://www.roche.com/solutions/pipeline
+fetch https://www.roche.com/solutions/pipeline
 
 # Click a button to download CSV
-./cli https://www.roche.com/solutions/pipeline --click "button:has-text('Download current view as CSV')"
+fetch https://roche.com/solutions/pipeline --click "button:has-text('Download current view as CSV')"
+
+# Save to file
+fetch https://roche.com/solutions/pipeline --click "button:has-text('Download current view as CSV')" -o pipeline.csv
+
+# More content (default 50K chars via MCP, unlimited via CLI)
+fetch https://en.wikipedia.org/wiki/Likelihood_ratio --max 100000
+```
+
+Start the MCP server:
+```bash
+make server    # start on port 5006
 ```
 
 ## MCP configuration

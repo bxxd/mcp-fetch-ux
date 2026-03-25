@@ -127,6 +127,7 @@ No API keys. No secrets.
 
 ```bash
 make setup     # poetry install + playwright install chromium
+make install   # setup + install 'fetch' CLI to ~/.local/bin/
 make server    # start (nohup, PID file, health check)
 make kill      # stop
 make logs      # tail
@@ -135,13 +136,22 @@ make ping      # health check
 
 ## CLI
 
+Installed as `fetch` via `make install`.
+
 ```bash
-./cli <url>                                           # basic fetch
-./cli <url> --max 20000                               # more content
-./cli <url> --click "text=Download current view as CSV"  # interact
-./cli <url> --click "#btn" --fill "input[name=q]=test"   # multiple actions
-./cli <url> --raw                                     # raw HTML
+fetch <url>                                             # full page content
+fetch <url> --max 5000                                  # limit output
+fetch <url> --click "text=Download current view as CSV" # interact
+fetch <url> --click "#btn" --fill "input[name=q]=test"  # multiple actions
+fetch <url> --raw                                       # raw HTML
+fetch <url> -o output.txt                               # save to file
 ```
+
+CLI defaults to unlimited output. MCP tool defaults to 50K chars with line-boundary truncation and pagination.
+
+### Downloads
+
+PDF downloads are automatically converted to text via `pdftotext`. Other binary formats (pptx, xlsx, zip, etc.) return a message with a `curl` command the agent can use to save the file locally.
 
 ## Endpoints
 
