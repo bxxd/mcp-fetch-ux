@@ -1,5 +1,19 @@
 # Developer Guide
 
+## Design Principles
+
+**ONE TRUE PATH**: One way to do each thing. CLI calls the handler. Handler calls the client. No alternate code paths, no fallbacks. If it's wrong, you'll know fast.
+
+**KISS**: Simplest solution that works. The clipboard approach is one line (`navigator.clipboard.readText()`) that replaces hundreds of lines of DOM traversal, Shadow DOM piercing, and Readability extraction for most pages.
+
+**SEPARATION OF CONCERNS**: Library fetches. Handler formats. Server routes. Tools describe. Each file does one thing.
+
+**HEXAGONAL**: `fetch_ux/` is the core — no MCP deps, no server deps. `mcp_fetch_ux/` is the adapter. Swap the transport without touching the fetcher.
+
+**PRIMARY SOURCES**: The browser renders the page. The clipboard captures what it renders. No intermediate summarization, no LLM interpretation. Raw content to the model.
+
+**DON'T CHANGE SHIT THAT WORKS**: The clipboard approach works on Shadow DOM, web components, SPAs, and static pages. Don't add Readability back as a "better" path — it fails on the hard cases that motivated this project.
+
 ## Architecture
 
 ```
@@ -14,19 +28,11 @@ mcp-fetch-ux/
 │       ├── server_http.py      HTTP/SSE transport (Starlette + Uvicorn)
 │       ├── handlers.py         Tool routing, shared FetchClient lifecycle
 │       └── tools.py            Tool schema definitions
-├── cli                         Quick test script (no server needed)
+├── cli                         Test script (calls handler directly)
 ├── Makefile
 ├── pyproject.toml
 └── .env                        PORT config (gitignored)
 ```
-
-### Separation of concerns
-
-- `fetch_ux/` — pure library. No MCP imports. Reusable from CLI, tests, other projects.
-- `mcp_fetch_ux/` — MCP server. Thin routing layer that calls `fetch_ux`.
-- `server_http.py` — transport only. SSE, health check, shutdown.
-- `handlers.py` — tool logic + shared `FetchClient` lifecycle.
-- `tools.py` — JSON schema definitions for MCP tool discovery.
 
 ### Content extraction pipeline
 
@@ -34,62 +40,107 @@ mcp-fetch-ux/
 page.goto(url, wait_until="domcontentloaded")
     │
     ▼
-Dismiss cookie/consent overlays (button click)
+Dismiss cookie/consent overlays
     │
     ▼
-Poll loop: Ctrl+A → Ctrl+C → clipboard.readText()
-    │  Repeat every 500ms until text length stabilizes
-    │  (2 consecutive equal readings after ≥1s)
-    │  Max 6s (12 polls)
+Poll: Ctrl+A → Ctrl+C → clipboard.readText()
+    │  500ms intervals, stable after 2 consecutive equal readings (≥1s)
+    │  Max 6s
     │
     ▼
-Return text with pagination (start_index / max_length)
+Run actions (if any) — click, fill, wait, select, scroll
+    │
+    ├─ Action triggers download? → return file content
+    │
+    ▼
+Discover available actions (buttons, links, inputs)
+    │
+    ▼
+Return text + available actions + pagination
 ```
 
-**Why clipboard, not innerText?** Shadow DOM. `page.innerText('body')` and
-`window.getSelection().toString()` don't cross shadow root boundaries. The
-clipboard API does — it captures what a human gets with Ctrl+A, Ctrl+C.
+### Why clipboard
 
-**Why poll for stability?** JS frameworks render asynchronously. The DOM loads
-fast but data arrives via API calls and renders into components over the next
-1-3 seconds. Polling detects when rendering is done without waiting for all
-network traffic (which includes analytics, fonts, tracking pixels).
+`page.innerText('body')` and `window.getSelection().toString()` don't cross Shadow DOM boundaries. The clipboard API does — it captures what a human gets with Ctrl+A, Ctrl+C. Tested on:
+
+- Roche pipeline (web components + Shadow DOM) — gets all 131 drugs
+- Wikipedia (static HTML) — gets full article
+- GitHub (React SPA) — gets full README
+
+### Why poll for stability
+
+JS frameworks render asynchronously. The DOM loads fast but data arrives via API calls and renders into components over 1-3 seconds. Polling detects when rendering is done without waiting for all network traffic (analytics, fonts, tracking pixels add seconds of pointless delay).
 
 ### Browser lifecycle
 
-One Chromium instance lives for the lifetime of the server process. Each fetch
-creates a fresh `BrowserContext` (isolated cookies, storage, permissions) and
-closes it in a `finally` block. This gives clean state per request without
-browser restart overhead.
+One Chromium instance for the lifetime of the server process. Each fetch creates a fresh `BrowserContext` (isolated cookies, storage, permissions) and closes it in a `finally` block. Clean state per request without browser restart overhead.
 
 `asyncio.Semaphore(3)` limits concurrent fetches to prevent memory spikes.
 
+### Actions
+
+Actions run after initial content capture. Supported:
+
+| Action | Parameters | Example |
+|--------|-----------|---------|
+| `click` | `selector` | `{"action": "click", "selector": "text=Download CSV"}` |
+| `fill` | `selector`, `value` | `{"action": "fill", "selector": "input[name=q]", "value": "query"}` |
+| `wait` | `selector` or `timeout` | `{"action": "wait", "selector": ".results"}` |
+| `select` | `selector`, `value` | `{"action": "select", "selector": "select#lang", "value": "en"}` |
+| `scroll` | `direction` | `{"action": "scroll", "direction": "bottom"}` |
+
+If a click triggers a file download (CSV, PDF, etc.), the file content is returned instead of page text.
+
+### Action discovery
+
+After fetching, the tool scans for visible interactive elements and appends them as hints:
+
+```
+Available actions on this page:
+  - click: "button:has-text('Download current view as CSV')"
+  - click: "button:has-text('Phase')"
+  - fill: "search" (search)
+  - click: "a:has-text('Careers')" → https://careers.roche.com
+```
+
+The agent sees what's available and can call again with actions. Two-step flow: discover, then act.
+
 ### Cookie/consent dismissal
 
-Tries common selectors in order, clicks the first visible match:
-- `button:has-text('Accept')`, `Accept All`, `OK`, `I Agree`
-- `[id*='cookie'] button`, `[class*='cookie'] button`, `[id*='consent'] button`
+Runs automatically before content capture AND before actions. Tries common selectors:
+- `#onetrust-reject-all-handler`, `#onetrust-accept-btn-handler`
+- `button:has-text('Accept All')`, `Reject All`, `Accept`, `OK`, `I Agree`
+- `[id*='cookie'] button`, `[class*='consent'] button`
 
-Quick 500ms visibility timeout per selector. Runs before content polling so
-overlays don't block the real content.
+300ms visibility timeout per selector. Clicks first match.
 
 ## Configuration
 
 ```bash
 # .env
-PORT=5006    # Server port (default 5006)
+PORT=5006
 ```
 
-No API keys needed. No secrets.
+No API keys. No secrets.
 
 ## Commands
 
 ```bash
 make setup     # poetry install + playwright install chromium
-make server    # Start server (nohup, PID file, health check)
-make kill      # Stop server
-make logs      # Tail logs
-make ping      # Health check
+make server    # start (nohup, PID file, health check)
+make kill      # stop
+make logs      # tail
+make ping      # health check
+```
+
+## CLI
+
+```bash
+./cli <url>                                           # basic fetch
+./cli <url> --max 20000                               # more content
+./cli <url> --click "text=Download current view as CSV"  # interact
+./cli <url> --click "#btn" --fill "input[name=q]=test"   # multiple actions
+./cli <url> --raw                                     # raw HTML
 ```
 
 ## Endpoints
@@ -101,31 +152,14 @@ make ping      # Health check
 | `/messages` | POST | MCP message handling |
 | `/shutdown` | POST | Graceful shutdown (closes browser) |
 
-## Testing
-
-```bash
-# Direct fetch (no server needed)
-./cli https://example.com
-./cli https://example.com 10000    # custom max_length
-
-# With server running
-make server
-# Connect via MCP client or test with curl:
-# SSE connection at http://127.0.0.1:5006/sse
-```
-
 ## Known behaviors
 
-- **SPA data loading**: Sites that load data via AJAX into web components (like
-  Roche's pipeline page) work because the clipboard captures Shadow DOM content.
-  The stabilization poll waits for this data to render.
+- **Shadow DOM / SPAs**: Clipboard captures everything the browser renders, regardless of Shadow DOM boundaries or JS framework.
 
-- **Headless detection**: Some sites detect headless browsers. The default
-  user-agent mimics Chrome on macOS. For sites that still block, consider
-  adding `--disable-blink-features=AutomationControlled` to browser args.
+- **File downloads**: Detected via Playwright's download event. Content returned as text. Binary files (PDFs) returned with `errors="replace"` — good enough for text extraction, not for binary fidelity.
 
-- **Memory**: Each fetch creates and destroys a browser context. The semaphore
-  limits concurrent contexts to 3. Monitor memory if running under heavy load.
+- **Headless detection**: Default user-agent mimics Chrome on macOS. Some sites still detect headless. Reddit blocks datacenter IPs regardless of user-agent — use Grok for those.
 
-- **PDF/binary content**: Not handled. Use `raw=true` to get the HTML response
-  for non-HTML content types.
+- **Memory**: Each fetch creates and destroys a browser context. Semaphore caps at 3 concurrent. Monitor under heavy load.
+
+- **Timeouts**: 30s default on all Playwright operations. Actions get 5s each. No operation hangs indefinitely.
