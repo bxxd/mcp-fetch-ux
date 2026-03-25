@@ -14,6 +14,7 @@ URL=""
 MAX_LENGTH=5000
 START_INDEX=0
 RAW=False
+OUTFILE=""
 ACTIONS="[]"
 
 action_list=()
@@ -29,12 +30,13 @@ while [[ $# -gt 0 ]]; do
         --max)    MAX_LENGTH="$2"; shift 2 ;;
         --start)  START_INDEX="$2"; shift 2 ;;
         --raw)    RAW=True; shift ;;
+        -o|--out) OUTFILE="$2"; shift 2 ;;
         *)        URL="$1"; shift ;;
     esac
 done
 
 if [[ -z "$URL" ]]; then
-    echo "Usage: ./cli <url> [--click selector] [--fill selector=value] [--wait selector|ms] [--max N] [--raw]"
+    echo "Usage: ./cli <url> [--click selector] [--fill sel=val] [--wait sel|ms] [--max N] [--raw] [-o file]"
     exit 1
 fi
 
@@ -45,6 +47,8 @@ fi
 ACTIONS_B64=$(echo -n "$ACTIONS" | base64 -w0)
 URL_B64=$(echo -n "$URL" | base64 -w0)
 
+OUTFILE_B64=$(echo -n "$OUTFILE" | base64 -w0)
+
 poetry run python3 -c "
 import asyncio, json, base64
 from mcp_fetch_ux.handlers import handle_fetch
@@ -52,8 +56,14 @@ from mcp_fetch_ux.handlers import handle_fetch
 async def main():
     actions = json.loads(base64.b64decode('$ACTIONS_B64').decode()) or None
     url = base64.b64decode('$URL_B64').decode()
+    outfile = base64.b64decode('$OUTFILE_B64').decode()
     result = await handle_fetch(url=url, actions=actions, max_length=$MAX_LENGTH, start_index=$START_INDEX, raw=$RAW)
-    print(result)
+    if outfile:
+        with open(outfile, 'w') as f:
+            f.write(result)
+        print(f'Wrote {len(result)} chars to {outfile}')
+    else:
+        print(result)
 
 asyncio.run(main())
 "
