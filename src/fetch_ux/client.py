@@ -4,6 +4,7 @@ Renders JS, extracts visible article content, returns markdown.
 30s timeout. No LLM. No cost.
 """
 
+import asyncio
 from dataclasses import dataclass
 
 import markdownify
@@ -49,6 +50,7 @@ class FetchClient:
         )
         self._browser: Browser | None = None
         self._pw = None
+        self._semaphore = asyncio.Semaphore(3)  # max 3 concurrent fetches
 
     async def start(self):
         """Launch browser. Call once at server startup."""
@@ -83,6 +85,16 @@ class FetchClient:
         if not self._browser:
             await self.start()
 
+        async with self._semaphore:
+            return await self._fetch_impl(url, max_length, start_index, raw)
+
+    async def _fetch_impl(
+        self,
+        url: str,
+        max_length: int,
+        start_index: int,
+        raw: bool,
+    ) -> FetchResult:
         context = await self._browser.new_context(
             user_agent=self.user_agent,
             viewport={"width": 1280, "height": 720},
@@ -93,6 +105,25 @@ class FetchClient:
         try:
             page = await context.new_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+
+            # Dismiss cookie/consent overlays that may block content
+            for selector in [
+                "button:has-text('Accept')",
+                "button:has-text('Accept All')",
+                "button:has-text('OK')",
+                "button:has-text('I Agree')",
+                "[id*='cookie'] button",
+                "[class*='cookie'] button",
+                "[id*='consent'] button",
+            ]:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.is_visible(timeout=500):
+                        await btn.click()
+                        await page.wait_for_timeout(500)
+                        break
+                except Exception:
+                    continue
 
             # Wait for JS content to render: poll clipboard text until stable
             # Require 2 consecutive stable readings after at least 1s
@@ -112,27 +143,6 @@ class FetchClient:
                 else:
                     stable_count = 0
                 prev_len = cur_len
-
-            # Dismiss common cookie/consent overlays
-            for selector in [
-                "button:has-text('Accept')",
-                "button:has-text('Accept All')",
-                "button:has-text('OK')",
-                "button:has-text('I Agree')",
-                "button:has-text('Continue')",
-                "[id*='cookie'] button",
-                "[class*='cookie'] button",
-                "[id*='consent'] button",
-                "[class*='consent'] button",
-            ]:
-                try:
-                    btn = page.locator(selector).first
-                    if await btn.is_visible(timeout=1000):
-                        await btn.click()
-                        await page.wait_for_timeout(1000)
-                        break
-                except Exception:
-                    continue
 
             title = await page.title()
 
