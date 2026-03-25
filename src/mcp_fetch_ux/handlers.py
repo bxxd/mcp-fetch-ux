@@ -52,10 +52,13 @@ async def handle_fetch(
     elapsed = time.time() - start
 
     logger.info(
-        f"fetch url={url} title={result.title!r} "
+        f"fetch url={url} status={result.status} title={result.title!r} "
         f"length={result.length} truncated={result.truncated} "
         f"time={elapsed:.1f}s"
     )
+
+    if result.status >= 400:
+        return f"HTTP {result.status} fetching {url}\n\n{result.content}"
 
     if not result.content:
         return f"No content extracted from {url}"

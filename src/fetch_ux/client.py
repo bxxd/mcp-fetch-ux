@@ -19,6 +19,7 @@ class FetchResult:
     title: str
     length: int
     truncated: bool
+    status: int = 200
 
 
 def extract_content_from_html(html: str) -> tuple[str, str]:
@@ -104,7 +105,8 @@ class FetchClient:
 
         try:
             page = await context.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            status = response.status if response else 0
 
             # Dismiss cookie/consent overlays that may block content
             for selector in [
@@ -177,4 +179,5 @@ class FetchClient:
             title=title,
             length=original_length,
             truncated=truncated,
+            status=status,
         )
