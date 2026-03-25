@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Quick test CLI — fetch a URL directly (no MCP server needed)
+set -euo pipefail
+cd "$(dirname "$0")"
+
+URL="${1:?Usage: ./cli <url> [max_length]}"
+MAX_LENGTH="${2:-5000}"
+
+poetry run python3 -c "
+import asyncio
+from fetch_ux import FetchClient
+
+async def main():
+    client = FetchClient()
+    await client.start()
+    try:
+        result = await client.fetch('$URL', max_length=$MAX_LENGTH)
+        if result.title:
+            print(f'Title: {result.title}')
+            print(f'Length: {result.length} chars')
+            print(f'Truncated: {result.truncated}')
+            print('---')
+        print(result.content)
+    finally:
+        await client.stop()
+
+asyncio.run(main())
+"
