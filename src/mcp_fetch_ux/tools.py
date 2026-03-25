@@ -2,7 +2,7 @@
 
 TOOLS = [
     {
-        "name": "fetch",
+        "name": "webfetch",
         "description": (
             "Fetch a URL using a real browser (Playwright). Renders JavaScript, "
             "captures Shadow DOM content via clipboard API.\n\n"
