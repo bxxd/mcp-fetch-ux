@@ -1,4 +1,4 @@
-.PHONY: server kill logs ping help setup
+.PHONY: server kill logs ping help setup install
 
 ENV := $(shell pwd | grep -q '/prod/' && echo prod || echo dev)
 
@@ -12,6 +12,7 @@ help:
 	@echo "  make kill    - Stop server"
 	@echo "  make logs    - Tail server logs"
 	@echo "  make ping    - Health check"
+	@echo "  make install - Install 'fetch' CLI to ~/.local/bin/"
 
 setup:
 	@echo "→ Installing dependencies..."
@@ -19,6 +20,14 @@ setup:
 	@echo "→ Installing Playwright browsers..."
 	@poetry run playwright install chromium
 	@echo "✓ Setup complete"
+
+install: setup
+	@mkdir -p ~/.local/bin
+	@SRC_DIR=$$(pwd) && \
+	echo '#!/usr/bin/env bash' > ~/.local/bin/fetch && \
+	echo "cd \"$$SRC_DIR\" && exec ./cli \"\$$@\"" >> ~/.local/bin/fetch && \
+	chmod +x ~/.local/bin/fetch
+	@echo "✓ Installed 'fetch' to ~/.local/bin/fetch"
 
 server:
 	@echo "Stopping existing server..."
