@@ -79,7 +79,7 @@ def extract_content_from_html(html: str) -> tuple[str, str]:
 class FetchClient:
     """Fetches URLs with Playwright (JS rendering) + clipboard extraction."""
 
-    def __init__(self, timeout_ms: int = 30_000, user_agent: str | None = None):
+    def __init__(self, timeout_ms: int = 60_000, user_agent: str | None = None):
         self.timeout_ms = timeout_ms
         self.user_agent = user_agent or (
             "Mozilla/5.0 (X11; Linux x86_64) "
@@ -130,7 +130,13 @@ class FetchClient:
             await self.start()
 
         async with self._semaphore:
-            return await self._fetch_impl(url, actions, max_length, start_index, raw)
+            try:
+                return await asyncio.wait_for(
+                    self._fetch_impl(url, actions, max_length, start_index, raw),
+                    timeout=self.timeout_ms / 1000,
+                )
+            except asyncio.TimeoutError:
+                raise TimeoutError(f"Timed out after {self.timeout_ms // 1000}s fetching {url}")
 
     async def _fetch_impl(
         self,
@@ -227,7 +233,10 @@ class FetchClient:
             )
             status = response.status if response else 0
 
-            await self._dismiss_overlays(page)
+            try:
+                await asyncio.wait_for(self._dismiss_overlays(page), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
             # Small human-like pause after page load
             await page.wait_for_timeout(random.randint(200, 600))
@@ -236,24 +245,33 @@ class FetchClient:
             text = ""
             prev_len = 0
             stable_count = 0
+            poll_start = asyncio.get_event_loop().time()
             for i in range(12):
                 await page.wait_for_timeout(random.randint(400, 600))
                 await page.keyboard.press("Control+a")
                 await page.keyboard.press("Control+c")
                 text = await page.evaluate("navigator.clipboard.readText()")
                 cur_len = len(text)
-                if cur_len == prev_len and i >= 2:
+                # Stable = <0.5% change (dynamic ads/counters jitter slightly)
+                delta = abs(cur_len - prev_len) / max(cur_len, 1)
+                if delta < 0.005 and i >= 2:
                     stable_count += 1
                     if stable_count >= 2:
                         break
                 else:
                     stable_count = 0
                 prev_len = cur_len
+                # If 15s elapsed and we have content, stop waiting — something's wrong
+                if asyncio.get_event_loop().time() - poll_start > 15 and cur_len > 0:
+                    break
 
             # Run actions
             if actions:
                 # Dismiss any overlays that appeared after content load
-                await self._dismiss_overlays(page)
+                try:
+                    await asyncio.wait_for(self._dismiss_overlays(page), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
                 for act in actions:
                     await self._run_action(page, act)
                     # Check if a download was triggered
@@ -400,7 +418,7 @@ class FetchClient:
             try:
                 btn = page.locator(selector).first
                 if await btn.is_visible(timeout=300):
-                    await btn.click()
+                    await btn.click(timeout=1000)
                     await page.wait_for_timeout(500)
                     return
             except Exception:
