@@ -32,9 +32,9 @@ install: setup
 server:
 	@echo "Stopping existing server..."
 	@if [ -f logs/server.pid ]; then \
-		kill $$(cat logs/server.pid) 2>/dev/null; \
+		kill $$(cat logs/server.pid) 2>/dev/null || true; \
 		sleep 1; \
-		kill -9 $$(cat logs/server.pid) 2>/dev/null; \
+		kill -9 $$(cat logs/server.pid) 2>/dev/null || true; \
 	fi
 	@rm -f logs/server.pid
 	@mkdir -p logs
