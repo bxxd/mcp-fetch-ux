@@ -44,13 +44,18 @@ async def handle_fetch(
     client = await get_client()
 
     start = time.time()
-    result = await client.fetch(
-        url=url,
-        actions=actions,
-        max_length=max_length,
-        start_index=start_index,
-        raw=raw,
-    )
+    try:
+        result = await client.fetch(
+            url=url,
+            actions=actions,
+            max_length=max_length,
+            start_index=start_index,
+            raw=raw,
+        )
+    except TimeoutError as e:
+        elapsed = time.time() - start
+        logger.error(f"fetch url={url} timed out after {elapsed:.1f}s")
+        return f"Error: {e}"
     elapsed = time.time() - start
 
     logger.info(

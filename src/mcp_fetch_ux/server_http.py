@@ -40,6 +40,7 @@ def setup_logging():
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(logging.INFO)
+    logging.getLogger("fetch_ux").setLevel(logging.INFO)
 
     # Quiet noisy loggers
     logging.getLogger("patchright").setLevel(logging.WARNING)
