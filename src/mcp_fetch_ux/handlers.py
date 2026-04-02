@@ -27,7 +27,7 @@ async def shutdown_client():
 
 
 async def call_tool(name: str, arguments: dict) -> str:
-    if name != "webfetch":
+    if name != "webpage_fetch":
         raise ValueError(f"Unknown tool: {name}")
 
     return await handle_fetch(**arguments)

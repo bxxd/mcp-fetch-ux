@@ -2,37 +2,45 @@
 
 TOOLS = [
     {
-        "name": "webfetch",
+        "name": "webpage_fetch",
         "description": (
-            "Fetch a URL using a real browser (Playwright). Renders JavaScript, "
-            "captures Shadow DOM content via clipboard API.\n\n"
-            "Optionally interact with the page before capturing: click buttons, "
-            "fill inputs, wait for elements. Interactions run in order.\n\n"
-            "If an interaction triggers a file download (CSV, PDF, etc.), the "
-            "file content is returned instead of the page text.\n\n"
-            "For large pages, content is paginated. Use start_index to read more.\n\n"
-            "30-second timeout — never hangs."
+            "webpage_fetch - retrieve text from a URL\n\n"
+            "SYNOPSIS\n"
+            "  webpage_fetch(url, [actions], [max_length], [start_index], [raw])\n\n"
+            "USAGE\n"
+            "  1. Call with a URL. Get back page text and available actions.\n"
+            "  2. To interact, pass actions from the response back in the actions parameter.\n"
+            "  3. Chain calls to navigate multi-page workflows (search, paginate, download).\n"
+            "  4. If response is truncated, call again with start_index to continue reading.\n"
+            "  5. If the site blocks you (403), switch to grok_blocked_webpage_fetch.\n\n"
+            "RETURNS\n"
+            "  Page text + list of discovered actions (buttons, links, forms).\n"
+            "  File downloads (CSV, PDF, XLSX) return file content directly.\n\n"
+            "LIMITS\n"
+            "  30-second timeout. No cookie persistence between calls."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "URL to fetch",
+                    "description": "URL to fetch.",
                 },
                 "actions": {
                     "type": "array",
                     "description": (
-                        "Actions to perform on the page before capturing content. "
-                        "Each action is an object with 'action' and parameters. "
-                        "Actions run in order. Supported actions:\n"
-                        '- {"action": "click", "selector": "text=Download CSV"}\n'
-                        '- {"action": "click", "selector": "#submit-button"}\n'
-                        '- {"action": "fill", "selector": "input[name=search]", "value": "query"}\n'
-                        '- {"action": "wait", "selector": ".results-table"}\n'
-                        '- {"action": "wait", "timeout": 2000}\n'
-                        '- {"action": "select", "selector": "select#country", "value": "US"}\n'
-                        '- {"action": "scroll", "direction": "bottom"}'
+                        "Ordered page interactions to execute before content capture. "
+                        "Use any combination to navigate multi-step workflows — "
+                        "the response includes discovered actions you can pass back on the next call.\n\n"
+                        "Available actions: click, fill, wait, select, scroll. "
+                        "Selectors follow CSS syntax or text= prefix for visible text matching.\n\n"
+                        "Examples:\n"
+                        '  {"action": "click", "selector": "text=Download CSV"}\n'
+                        '  {"action": "fill", "selector": "input[name=q]", "value": "AAPL"}\n'
+                        '  {"action": "wait", "selector": ".results"}\n'
+                        '  {"action": "wait", "timeout": 2000}\n'
+                        '  {"action": "select", "selector": "select#period", "value": "annual"}\n'
+                        '  {"action": "scroll", "direction": "bottom"}'
                     ),
                     "items": {
                         "type": "object",
@@ -51,12 +59,12 @@ TOOLS = [
                 },
                 "max_length": {
                     "type": "integer",
-                    "description": "Maximum characters to return. Default 50000. Truncates on line boundary.",
+                    "description": "Maximum characters to return. Default 50000. Truncated on line boundary.",
                     "default": 50000,
                 },
                 "start_index": {
                     "type": "integer",
-                    "description": "Start content at this character index (for pagination after truncation).",
+                    "description": "Character offset to resume from after truncation.",
                     "default": 0,
                 },
                 "raw": {
