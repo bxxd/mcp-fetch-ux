@@ -162,8 +162,11 @@ Uses **Patchright** (drop-in Playwright replacement) + init scripts + header ove
 ## Configuration
 
 ```bash
-# .env
+# .env (dev)
 PORT=5017
+
+# .env (prod)
+PORT=5007
 ```
 
 No API keys. No secrets.

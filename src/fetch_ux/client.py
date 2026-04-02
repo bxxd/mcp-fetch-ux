@@ -88,6 +88,8 @@ class FetchClient:
         self._browser: Browser | None = None
         self._pw = None
         self._semaphore = asyncio.Semaphore(3)
+        self._needs_restart = False
+        self._recycle_lock = asyncio.Lock()
 
     async def start(self):
         """Launch browser. Call once at server startup."""
@@ -99,15 +101,45 @@ class FetchClient:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disk-cache-size=1",
+                "--media-cache-size=1",
+                "--aggressive-cache-discard",
             ],
         )
 
     async def stop(self):
         """Close browser. Call at server shutdown."""
         if self._browser:
-            await self._browser.close()
+            try:
+                await asyncio.wait_for(self._browser.close(), timeout=5.0)
+            except Exception:
+                pass
         if self._pw:
             await self._pw.stop()
+
+    async def _recycle_browser(self):
+        """Swap in a fresh browser to flush stuck renderers.
+
+        Saves old browser references, starts a new browser (new fetches use it
+        immediately), then closes the old one. In-flight fetches on the old browser
+        complete naturally on their existing contexts.
+        """
+        logger.warning("Recycling browser — flushing stuck renderer")
+        old_browser, old_pw = self._browser, self._pw
+        self._needs_restart = False
+        try:
+            await self.start()
+        except Exception:
+            self._browser, self._pw = old_browser, old_pw
+            self._needs_restart = True
+            raise
+        if old_browser:
+            try:
+                await asyncio.wait_for(old_browser.close(), timeout=5.0)
+            except Exception:
+                pass
+        if old_pw:
+            await old_pw.stop()
 
     async def fetch(
         self,
@@ -128,6 +160,11 @@ class FetchClient:
         """
         if not self._browser:
             await self.start()
+
+        if self._needs_restart:
+            async with self._recycle_lock:
+                if self._needs_restart:  # re-check under lock
+                    await self._recycle_browser()
 
         async with self._semaphore:
             try:
@@ -306,7 +343,12 @@ class FetchClient:
             # Discover available actions on the page
             actions_available = await self._discover_actions(page)
         finally:
-            await context.close()
+            try:
+                await asyncio.wait_for(context.close(), timeout=5.0)
+            except Exception:
+                if not self._recycle_lock.locked():
+                    self._needs_restart = True
+                logger.warning(f"context.close() timed out for {url} — scheduling browser recycle")
 
         original_length = len(content)
         truncated = False
@@ -376,6 +418,20 @@ class FetchClient:
                     }
                 });
 
+                // Elements with onclick window.location (clickable divs etc.)
+                document.querySelectorAll('[onclick]').forEach(el => {
+                    const onclick = el.getAttribute('onclick') || '';
+                    const m = onclick.match(/window\.location\s*=\s*['"]([^'"]+)['"]/);
+                    if (m && el.offsetParent !== null) {
+                        const href = m[1];
+                        const text = el.querySelector('.post-title, h1, h2, h3')?.textContent?.trim()
+                            || el.textContent?.trim().substring(0, 60);
+                        if (text) {
+                            add('click: "[onclick]" → ' + href + ' (' + text.replace(/\s+/g, ' ') + ')');
+                        }
+                    }
+                });
+
                 // Download links
                 document.querySelectorAll('a[download], a[href$=".csv"], a[href$=".pdf"], a[href$=".xlsx"]').forEach(el => {
                     const text = el.textContent?.trim() || el.getAttribute('download') || el.href;
@@ -396,7 +452,7 @@ class FetchClient:
                     }
                 });
 
-                return actions.slice(0, 20);  // Cap at 20 to keep output reasonable
+                return actions.slice(0, 50);  // Cap at 50
             }""")
         except Exception:
             return []

@@ -31,12 +31,18 @@ install: setup
 
 server:
 	@echo "Stopping existing server..."
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+		curl -sf --max-time 5 -X POST http://127.0.0.1:$${PORT:-5006}/shutdown >/dev/null 2>&1 || true
+	@sleep 1
 	@if [ -f logs/server.pid ]; then \
 		kill $$(cat logs/server.pid) 2>/dev/null || true; \
 		sleep 1; \
 		kill -9 $$(cat logs/server.pid) 2>/dev/null || true; \
 	fi
 	@rm -f logs/server.pid
+	@VENV=$$(poetry env info --path 2>/dev/null); \
+		[ -n "$$VENV" ] && pkill -9 -f "$$VENV" 2>/dev/null || true
+	@sleep 1
 	@mkdir -p logs
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 		echo "Starting mcp-fetch-ux on port $${PORT:-5006} (logs/server.log)..."; \
@@ -56,11 +62,18 @@ server:
 		exit 1
 
 kill:
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+		curl -sf --max-time 5 -X POST http://127.0.0.1:$${PORT:-5006}/shutdown >/dev/null 2>&1 || true
+	@sleep 1
 	@if [ -f logs/server.pid ]; then \
-		kill $$(cat logs/server.pid) 2>/dev/null && rm logs/server.pid && echo "Server stopped" || echo "No server running"; \
-	else \
-		echo "No server running"; \
+		kill $$(cat logs/server.pid) 2>/dev/null || true; \
+		sleep 1; \
+		kill -9 $$(cat logs/server.pid) 2>/dev/null || true; \
+		rm -f logs/server.pid; \
 	fi
+	@VENV=$$(poetry env info --path 2>/dev/null); \
+		[ -n "$$VENV" ] && pkill -9 -f "$$VENV" 2>/dev/null || true
+	@echo "Server stopped"
 
 logs:
 	@tail -f logs/server.log
