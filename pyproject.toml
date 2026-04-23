@@ -3,6 +3,7 @@ name = "mcp-fetch-ux"
 version = "0.1.0"
 description = "Playwright-based web fetch MCP server with Readability extraction"
 authors = ["idio"]
+license = "MIT"
 readme = "DEVELOPER.md"
 packages = [
     { include = "fetch_ux", from = "src" },
