@@ -91,6 +91,50 @@ async def handle_ping(request: Request):
     return JSONResponse({"status": "ok"})
 
 
+async def handle_fetch_json(request: Request):
+    """Raw JSON fetch endpoint.
+
+    Same shape as the MCP `webpage_fetch` tool but plain HTTP — used by the
+    Rust edge at pithy.bot (and anyone else who'd rather POST JSON than wrap
+    MCP protocol). Request body:
+
+        {
+          "url": "...",
+          "actions": [...],          // optional
+          "max_length": 50000,       // optional
+          "start_index": 0,          // optional
+          "raw": false               // optional
+        }
+
+    Response: {"content": "..."} on success, {"error": "..."} on failure.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    url = body.get("url")
+    if not url or not isinstance(url, str):
+        return JSONResponse({"error": "missing or invalid 'url'"}, status_code=400)
+    # Tolerate explicit nulls (Rust's serde serializes Option::None as null,
+    # not as a missing field) and treat them as "use default".
+    def _or_default(key, default):
+        v = body.get(key)
+        return default if v is None else v
+
+    try:
+        content = await handlers.handle_fetch(
+            url=url,
+            actions=body.get("actions"),
+            max_length=int(_or_default("max_length", 50000)),
+            start_index=int(_or_default("start_index", 0)),
+            raw=bool(_or_default("raw", False)),
+        )
+        return JSONResponse({"content": content})
+    except Exception as e:
+        logger.exception("handle_fetch_json failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 async def handle_shutdown(request: Request):
     await handlers.shutdown_client()
     return JSONResponse({"status": "shutdown"})
@@ -118,6 +162,7 @@ async def lifespan(app):
 app = Starlette(
     routes=[
         Route("/ping", handle_ping, methods=["GET"]),
+        Route("/fetch", handle_fetch_json, methods=["POST"]),
         Mount("/mcp", app=transport.handle_request),
         Route("/sse", handle_sse),
         Mount("/messages", app=sse.handle_post_message),

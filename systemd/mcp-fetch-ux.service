@@ -1,0 +1,19 @@
+[Unit]
+Description=mcp-fetch-ux — Patchright-backed web fetch worker
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/work/dev/mcp-fetch-ux
+Environment=PORT=5017
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.cache/pypoetry/virtualenvs/mcp-fetch-ux-TM0Unpyq-py3.12/bin:/usr/bin
+ExecStart=/home/ubuntu/.cache/pypoetry/virtualenvs/mcp-fetch-ux-TM0Unpyq-py3.12/bin/python -m mcp_fetch_ux.server_http
+Restart=on-failure
+RestartSec=5
+# Patchright wants this for chromium sandbox
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
