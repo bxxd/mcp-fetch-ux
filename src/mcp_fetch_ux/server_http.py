@@ -130,6 +130,8 @@ async def handle_fetch_json(request: Request):
             raw=bool(_or_default("raw", False)),
         )
         return JSONResponse({"content": content})
+    except handlers.UnsafeUrl as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         logger.exception("handle_fetch_json failed")
         return JSONResponse({"error": str(e)}, status_code=500)
