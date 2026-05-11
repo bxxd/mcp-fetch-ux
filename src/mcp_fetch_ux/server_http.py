@@ -94,7 +94,7 @@ async def handle_ping(request: Request):
 async def handle_fetch_json(request: Request):
     """Raw JSON fetch endpoint.
 
-    Same shape as the MCP `webpage_fetch` tool but plain HTTP — used by the
+    Same shape as the MCP `pithy-fetch` tool but plain HTTP — used by the
     Rust edge at pithy.bot (and anyone else who'd rather POST JSON than wrap
     MCP protocol). Request body:
 
