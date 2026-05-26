@@ -1,22 +1,25 @@
-"""Playwright-based web fetcher with clipboard extraction.
+"""Stealth-Firefox web fetcher with clipboard extraction.
 
 Renders JS, captures visible text (including Shadow DOM) via Ctrl+A/Ctrl+C.
 Supports page interactions (click, fill, wait) and file downloads.
 30s timeout. No LLM. No cost.
+
+Engine: invisible_playwright — a C++-fingerprint-patched Firefox that passes
+reCAPTCHA v3 (including Google SERP), where Chromium-based stealth hits a
+ceiling. Drop-in Playwright API. Needs a display — run headed under xvfb.
 """
 
 import asyncio
 import logging
 import os
 import random
-import shutil
 import subprocess
-import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from patchright.async_api import async_playwright, Download
+from playwright.async_api import Download
+
+from fetch_ux.engines import make_engine
 
 logger = logging.getLogger("fetch_ux")
 
@@ -77,139 +80,65 @@ def _int_env(name: str, default: int) -> int:
 
 
 class FetchClient:
-    """Fetches URLs with real Chrome (Patchright) + clipboard extraction.
+    """Fetches URLs: a swappable browser engine + clipboard extraction.
 
-    One engine, no fallback: real Google Chrome via a persistent context. Needs
-    Chrome installed (`patchright install chrome`) and a display — run headed under
-    xvfb on a server; `FETCH_UX_HEADLESS=1` forces headless (more detectable).
+    Hexagonal — the browser is a port (`fetch_ux.engines.BrowserEngine`). This
+    core only does extraction (clipboard/Shadow-DOM capture, overlay dismissal,
+    actions, downloads, truncation) on a Playwright Page; *which* browser produces
+    that page is the adapter's job. Pick it with FETCH_UX_ENGINE (default
+    `invisible` — stealth Firefox that beats reCAPTCHA v3; or `chrome`).
+
+    Periodic recycle (FETCH_UX_RECYCLE_TTL, default 1 day) rotates the session —
+    cookies for Chrome, fingerprint for invisible.
     """
 
     def __init__(
         self,
         timeout_ms: int = 60_000,
+        engine=None,
         *,
-        headless: bool | None = None,
-        cookie_ttl_sec: int | None = None,
+        recycle_ttl_sec: int | None = None,
     ):
         self.timeout_ms = timeout_ms
-        # Patchright is most undetectable headed (run under xvfb); headless is more
-        # detectable. Default headed.
-        self._headless = (
-            headless if headless is not None
-            else os.environ.get("FETCH_UX_HEADLESS", "0") == "1"
-        )
-        # Throw the shared cookie jar away on a timer so one flagged session can't
-        # poison us forever. Routed through the recycle path. 0 = never.
+        self._engine = engine if engine is not None else make_engine(timeout_ms)
         ttl = (
-            cookie_ttl_sec if cookie_ttl_sec is not None
-            else _int_env("FETCH_UX_COOKIE_TTL", 86400)
+            recycle_ttl_sec if recycle_ttl_sec is not None
+            else _int_env("FETCH_UX_RECYCLE_TTL", 86400)
         )
-        self._cookie_ttl = max(0, ttl)  # negative is meaningless; 0 = never rotate
-        self._context = None          # persistent BrowserContext — the one engine
-        self._user_data_dir: str | None = None
-        self._context_born: float = 0.0
-        self._pw = None
+        self._recycle_ttl = max(0, ttl)  # negative is meaningless; 0 = never recycle
+        self._started = False
+        self._born: float = 0.0
         self._semaphore = asyncio.Semaphore(3)
         self._needs_restart = False
         self._recycle_lock = asyncio.Lock()
 
     async def start(self):
-        """Launch real Chrome once. Call at server startup.
-
-        One persistent context (real Google Chrome via channel="chrome") = a warm,
-        shared cookie jar. No UA spoof, no Sec-CH-UA, no AutomationControlled flag,
-        no init scripts: real Chrome + Patchright present a coherent fingerprint;
-        layering manual masks on top only creates detectable inconsistencies.
-        """
-        self._pw = await async_playwright().start()
-        # Fresh profile dir each launch → recycling (incl. the daily TTL) wipes
-        # cookies for free.
-        self._user_data_dir = tempfile.mkdtemp(prefix="fetchux-chrome-")
-        try:
-            self._context = await self._pw.chromium.launch_persistent_context(
-                self._user_data_dir,
-                channel="chrome",          # real Google Chrome, not bundled Chromium
-                headless=self._headless,
-                no_viewport=True,          # use the real window size; don't fingerprint
-                locale="en-US",
-                permissions=["clipboard-read", "clipboard-write"],
-                accept_downloads=True,
-                args=self._chrome_args(),
-            )
-        except Exception:
-            # If Chrome is missing/misconfigured, don't leak the temp profile or
-            # the started Playwright process.
-            self._remove_dir(self._user_data_dir)
-            self._user_data_dir = None
-            try:
-                await self._pw.stop()
-            except Exception:
-                pass
-            self._pw = None
-            raise
-        self._context.set_default_timeout(self.timeout_ms)
-        self._context_born = time.monotonic()
-        logger.info(
-            "FetchClient: Chrome up (channel=chrome, headless=%s, profile=%s)",
-            self._headless, self._user_data_dir,
-        )
-
-    @staticmethod
-    def _remove_dir(path: str | None):
-        if path:
-            shutil.rmtree(path, ignore_errors=True)
-
-    @staticmethod
-    def _chrome_args() -> list[str]:
-        """If a DRM render node is present (a GPU was passed into the container),
-        drive WebGL through it via ANGLE/EGL so the renderer reports the real GPU
-        instead of 'WebGL: False' — a glaring automation tell. No-op without a GPU,
-        so this stays safe on GPU-less hosts."""
-        if os.path.exists("/dev/dri/renderD128"):
-            return [
-                "--use-gl=angle",
-                "--use-angle=gl-egl",   # ANGLE over native EGL → Mesa iris → render node
-                "--ignore-gpu-blocklist",
-                "--enable-gpu-rasterization",
-            ]
-        return []
+        """Launch the engine's browser once. Call at server startup."""
+        await self._engine.start()
+        self._started = True
+        self._born = asyncio.get_event_loop().time()
 
     async def stop(self):
-        """Close browser. Call at server shutdown."""
-        if self._context:
-            try:
-                await asyncio.wait_for(self._context.close(), timeout=5.0)
-            except Exception:
-                pass
-        if self._pw:
-            await self._pw.stop()
-        self._remove_dir(self._user_data_dir)
+        """Close the engine's browser. Call at server shutdown."""
+        try:
+            await self._engine.stop()
+        finally:
+            self._started = False
 
     async def _recycle_browser(self):
-        """Swap in a fresh context — to flush a stuck renderer, and to throw the
-        cookie jar away when the TTL expires (which routes here too).
-
-        Starts fresh (new fetches use it immediately), then closes the old one.
-        In-flight fetches finish naturally on the old context.
-        """
-        logger.warning("Recycling Chrome — flushing renderer / rotating cookies")
-        old_ctx, old_pw, old_dir = self._context, self._pw, self._user_data_dir
-        self._context = None
+        """Flush a stuck renderer / rotate the session: stop then restart the
+        engine. New fetches use the fresh browser immediately."""
+        logger.warning(
+            "Recycling engine=%s — flushing renderer / rotating session",
+            getattr(self._engine, "name", "?"),
+        )
         self._needs_restart = False
         try:
-            await self.start()
+            await self._engine.stop()
         except Exception:
-            self._context, self._pw, self._user_data_dir = old_ctx, old_pw, old_dir
-            self._needs_restart = True
-            raise
-        if old_ctx:
-            try:
-                await asyncio.wait_for(old_ctx.close(), timeout=5.0)
-            except Exception:
-                pass
-        if old_pw:
-            await old_pw.stop()
-        self._remove_dir(old_dir)  # discard the old cookie profile
+            pass
+        await self._engine.start()
+        self._born = asyncio.get_event_loop().time()
 
     async def fetch(
         self,
@@ -228,15 +157,15 @@ class FetchClient:
             start_index: Start content extraction at this char index.
             raw: Return raw HTML instead of clipboard text.
         """
-        if self._context is None:
+        if not self._started:
             await self.start()
 
-        # Daily cookie throw-away: expire the warm jar so a flagged session can't
-        # poison us forever. Routes through the same recycle path as stuck renderers.
+        # Periodic recycle: rotate the session so a flagged one can't poison us
+        # forever. Routes through the same recycle path as stuck renderers.
         if (
-            self._cookie_ttl > 0
-            and self._context_born
-            and time.monotonic() - self._context_born > self._cookie_ttl
+            self._recycle_ttl > 0
+            and self._born
+            and asyncio.get_event_loop().time() - self._born > self._recycle_ttl
         ):
             self._needs_restart = True
 
@@ -254,26 +183,22 @@ class FetchClient:
             except asyncio.TimeoutError:
                 raise TimeoutError(f"Timed out after {self.timeout_ms // 1000}s fetching {url}")
 
-    def _closer(self, closeable, kind: str):
+    def _closer(self, page):
         """Build the per-fetch release coroutine; on a close hang, flag a recycle."""
         async def _release(url: str = ""):
             try:
-                await asyncio.wait_for(closeable.close(), timeout=5.0)
+                await asyncio.wait_for(page.close(), timeout=5.0)
             except Exception:
                 if not self._recycle_lock.locked():
                     self._needs_restart = True
-                logger.warning("%s.close() timed out for %s — scheduling recycle", kind, url)
+                logger.warning("page.close() timed out for %s — scheduling recycle", url)
         return _release
 
     async def _acquire_page(self):
-        """Open a page on the warm persistent context (shared cookie jar). The
-        context stays alive; only the page is closed after the fetch."""
-        page = await self._context.new_page()
-        try:
-            page.set_default_timeout(self.timeout_ms)
-        except Exception:
-            pass
-        return page, self._closer(page, "page")
+        """Get a page from the engine; the engine keeps the browser warm, we just
+        open and close the page per fetch."""
+        page = await self._engine.new_page()
+        return page, self._closer(page)
 
     async def _fetch_impl(
         self,
@@ -301,7 +226,7 @@ class FetchClient:
             status = response.status if response else 0
 
             try:
-                await asyncio.wait_for(self._dismiss_overlays(page), timeout=2.0)
+                await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=2.0)
             except (asyncio.TimeoutError, Exception):
                 pass
 
@@ -315,9 +240,7 @@ class FetchClient:
             poll_start = asyncio.get_event_loop().time()
             for i in range(12):
                 await page.wait_for_timeout(random.randint(400, 600))
-                await page.keyboard.press("Control+a")
-                await page.keyboard.press("Control+c")
-                text = await page.evaluate("navigator.clipboard.readText()")
+                text = await self._engine.capture_text(page)
                 cur_len = len(text)
                 # Stable = <0.5% change (dynamic ads/counters jitter slightly)
                 delta = abs(cur_len - prev_len) / max(cur_len, 1)
@@ -332,11 +255,21 @@ class FetchClient:
                 if asyncio.get_event_loop().time() - poll_start > 15 and cur_len > 0:
                     break
 
+            # Late cookie/consent banners (SPA frameworks inject them after the
+            # initial dismiss). Now that content is rendered, try once more — and if
+            # we actually removed one, re-capture so its text isn't in the output.
+            try:
+                if await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=3.0):
+                    await page.wait_for_timeout(300)
+                    text = await self._engine.capture_text(page)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
             # Run actions
             if actions:
                 # Dismiss any overlays that appeared after content load
                 try:
-                    await asyncio.wait_for(self._dismiss_overlays(page), timeout=5.0)
+                    await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=5.0)
                 except (asyncio.TimeoutError, Exception):
                     pass
                 for act in actions:
@@ -365,9 +298,7 @@ class FetchClient:
             else:
                 # Re-capture clipboard after actions (content may have changed)
                 if actions:
-                    await page.keyboard.press("Control+a")
-                    await page.keyboard.press("Control+c")
-                    text = await page.evaluate("navigator.clipboard.readText()")
+                    text = await self._engine.capture_text(page)
                 content = text
 
             # Discover available actions on the page
@@ -481,29 +412,6 @@ class FetchClient:
             }""")
         except Exception:
             return []
-
-    async def _dismiss_overlays(self, page):
-        """Dismiss cookie/consent overlays blocking interaction."""
-        for selector in [
-            "#onetrust-reject-all-handler",
-            "#onetrust-accept-btn-handler",
-            "button:has-text('Accept All')",
-            "button:has-text('Reject All')",
-            "button:has-text('Accept')",
-            "button:has-text('OK')",
-            "button:has-text('I Agree')",
-            "[id*='cookie'] button",
-            "[class*='cookie'] button",
-            "[id*='consent'] button",
-        ]:
-            try:
-                btn = page.locator(selector).first
-                if await btn.is_visible(timeout=300):
-                    await btn.click(timeout=1000)
-                    await page.wait_for_timeout(500)
-                    return
-            except Exception:
-                continue
 
     async def _run_action(self, page, act: dict):
         """Execute a single page action."""

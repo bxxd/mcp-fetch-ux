@@ -6,6 +6,8 @@ import tempfile
 import pytest
 
 from fetch_ux.client import _read_download, FetchClient, FetchResult
+from fetch_ux.engines import make_engine
+from fetch_ux.engines.chrome import _chrome_args, ChromeEngine
 from mcp_fetch_ux.tools import TOOLS
 from mcp_fetch_ux.handlers import call_tool, _validate_url, UnsafeUrl
 
@@ -85,77 +87,94 @@ def test_fetch_result_defaults():
     assert r.actions_available is None
 
 
-# --- FetchClient config: real-Chrome engine + GPU args (no browser) ---
+# --- Engine factory (hexagonal: swap the engine, no browser) ---
 
+def test_make_engine_default_is_invisible(monkeypatch):
+    monkeypatch.delenv("FETCH_UX_ENGINE", raising=False)
+    assert make_engine().name == "invisible"
+
+
+def test_make_engine_selects_chrome(monkeypatch):
+    monkeypatch.setenv("FETCH_UX_ENGINE", "chrome")
+    assert make_engine().name == "chrome"
+
+
+def test_make_engine_explicit_overrides_env(monkeypatch):
+    monkeypatch.setenv("FETCH_UX_ENGINE", "chrome")
+    assert make_engine(name="invisible").name == "invisible"
+
+
+def test_make_engine_unknown_raises():
+    with pytest.raises(ValueError, match="unknown FETCH_UX_ENGINE"):
+        make_engine(name="webkit")
+
+
+def test_engines_satisfy_port():
+    """Both adapters expose the BrowserEngine interface."""
+    for name in ("invisible", "chrome"):
+        e = make_engine(name=name)
+        for m in ("start", "new_page", "capture_text", "dismiss_overlays", "stop"):
+            assert callable(getattr(e, m)), f"{name} missing {m}"
+
+
+# --- Chrome engine: GPU args + config (no browser) ---
 
 def test_chrome_args_empty_without_render_node(monkeypatch):
     """No DRM render node → no GPU flags (safe no-op on GPU-less hosts)."""
     monkeypatch.setattr(os.path, "exists", lambda p: False)
-    assert FetchClient._chrome_args() == []
+    assert _chrome_args() == []
 
 
 def test_chrome_args_present_with_render_node(monkeypatch):
     """Render node present → drive WebGL through it via ANGLE/EGL."""
     monkeypatch.setattr(os.path, "exists", lambda p: p == "/dev/dri/renderD128")
-    args = FetchClient._chrome_args()
+    args = _chrome_args()
     assert "--use-gl=angle" in args
     assert "--use-angle=gl-egl" in args
 
 
-def test_init_defaults(monkeypatch):
-    """Unset env → headed (xvfb-friendly) with a 1-day cookie TTL."""
+def test_chrome_headless_default(monkeypatch):
     monkeypatch.delenv("FETCH_UX_HEADLESS", raising=False)
-    monkeypatch.delenv("FETCH_UX_COOKIE_TTL", raising=False)
-    c = FetchClient()
-    assert c._headless is False
-    assert c._cookie_ttl == 86400
+    assert ChromeEngine()._headless is False
 
 
-def test_init_explicit_args_win_over_env(monkeypatch):
-    """Explicit kwargs override env vars."""
-    monkeypatch.setenv("FETCH_UX_HEADLESS", "0")
-    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "999")
-    c = FetchClient(headless=True, cookie_ttl_sec=123)
-    assert c._headless is True
-    assert c._cookie_ttl == 123
-
-
-def test_init_cookie_ttl_from_env(monkeypatch):
-    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "3600")
-    assert FetchClient()._cookie_ttl == 3600
-
-
-def test_init_cookie_ttl_garbage_falls_back(monkeypatch):
-    """Non-integer env must not crash client creation."""
-    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "1h")
-    assert FetchClient()._cookie_ttl == 86400
-
-
-def test_init_cookie_ttl_blank_falls_back(monkeypatch):
-    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "")
-    assert FetchClient()._cookie_ttl == 86400
-
-
-def test_init_cookie_ttl_negative_clamped(monkeypatch):
-    monkeypatch.delenv("FETCH_UX_COOKIE_TTL", raising=False)
-    assert FetchClient(cookie_ttl_sec=-5)._cookie_ttl == 0
-
-
-def test_init_headless_env_toggle(monkeypatch):
+def test_chrome_headless_env(monkeypatch):
     monkeypatch.setenv("FETCH_UX_HEADLESS", "1")
-    assert FetchClient()._headless is True
+    assert ChromeEngine()._headless is True
 
 
-def test_remove_dir_safe_on_none():
-    FetchClient._remove_dir(None)  # must not raise
+def test_chrome_remove_dir_safe_on_none():
+    ChromeEngine._remove_dir(None)  # must not raise
 
 
-def test_remove_dir_removes_profile(tmp_path):
+def test_chrome_remove_dir_removes_profile(tmp_path):
     d = tmp_path / "profile"
     d.mkdir()
     (d / "cookies").write_text("x")
-    FetchClient._remove_dir(str(d))
+    ChromeEngine._remove_dir(str(d))
     assert not d.exists()
+
+
+# --- FetchClient recycle-TTL config (engine injected, no browser) ---
+
+def test_recycle_ttl_default(monkeypatch):
+    monkeypatch.delenv("FETCH_UX_RECYCLE_TTL", raising=False)
+    assert FetchClient(engine=object())._recycle_ttl == 86400
+
+
+def test_recycle_ttl_explicit_overrides_env(monkeypatch):
+    monkeypatch.setenv("FETCH_UX_RECYCLE_TTL", "999")
+    assert FetchClient(engine=object(), recycle_ttl_sec=123)._recycle_ttl == 123
+
+
+def test_recycle_ttl_garbage_falls_back(monkeypatch):
+    """Non-integer env must not crash client creation."""
+    monkeypatch.setenv("FETCH_UX_RECYCLE_TTL", "1h")
+    assert FetchClient(engine=object())._recycle_ttl == 86400
+
+
+def test_recycle_ttl_negative_clamped():
+    assert FetchClient(engine=object(), recycle_ttl_sec=-5)._recycle_ttl == 0
 
 
 # --- _validate_url (SSRF guard) — IP literals/scheme/hostname need no DNS ---
