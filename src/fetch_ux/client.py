@@ -63,6 +63,19 @@ def _read_download(path: str, filename: str | None, url: str | None = None) -> s
         return f.read()
 
 
+def _int_env(name: str, default: int) -> int:
+    """Parse an int env var, falling back to `default` on unset/blank/garbage
+    (e.g. "" or "1h") instead of crashing client creation."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        logger.warning("invalid %s=%r — using default %d", name, raw, default)
+        return default
+
+
 class FetchClient:
     """Fetches URLs with real Chrome (Patchright) + clipboard extraction.
 
@@ -87,10 +100,11 @@ class FetchClient:
         )
         # Throw the shared cookie jar away on a timer so one flagged session can't
         # poison us forever. Routed through the recycle path. 0 = never.
-        self._cookie_ttl = (
+        ttl = (
             cookie_ttl_sec if cookie_ttl_sec is not None
-            else int(os.environ.get("FETCH_UX_COOKIE_TTL", "86400"))
+            else _int_env("FETCH_UX_COOKIE_TTL", 86400)
         )
+        self._cookie_ttl = max(0, ttl)  # negative is meaningless; 0 = never rotate
         self._context = None          # persistent BrowserContext — the one engine
         self._user_data_dir: str | None = None
         self._context_born: float = 0.0
@@ -111,16 +125,28 @@ class FetchClient:
         # Fresh profile dir each launch → recycling (incl. the daily TTL) wipes
         # cookies for free.
         self._user_data_dir = tempfile.mkdtemp(prefix="fetchux-chrome-")
-        self._context = await self._pw.chromium.launch_persistent_context(
-            self._user_data_dir,
-            channel="chrome",          # real Google Chrome, not bundled Chromium
-            headless=self._headless,
-            no_viewport=True,          # use the real window size; don't fingerprint
-            locale="en-US",
-            permissions=["clipboard-read", "clipboard-write"],
-            accept_downloads=True,
-            args=self._chrome_args(),
-        )
+        try:
+            self._context = await self._pw.chromium.launch_persistent_context(
+                self._user_data_dir,
+                channel="chrome",          # real Google Chrome, not bundled Chromium
+                headless=self._headless,
+                no_viewport=True,          # use the real window size; don't fingerprint
+                locale="en-US",
+                permissions=["clipboard-read", "clipboard-write"],
+                accept_downloads=True,
+                args=self._chrome_args(),
+            )
+        except Exception:
+            # If Chrome is missing/misconfigured, don't leak the temp profile or
+            # the started Playwright process.
+            self._remove_dir(self._user_data_dir)
+            self._user_data_dir = None
+            try:
+                await self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+            raise
         self._context.set_default_timeout(self.timeout_ms)
         self._context_born = time.monotonic()
         logger.info(

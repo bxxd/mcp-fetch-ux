@@ -128,6 +128,22 @@ def test_init_cookie_ttl_from_env(monkeypatch):
     assert FetchClient()._cookie_ttl == 3600
 
 
+def test_init_cookie_ttl_garbage_falls_back(monkeypatch):
+    """Non-integer env must not crash client creation."""
+    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "1h")
+    assert FetchClient()._cookie_ttl == 86400
+
+
+def test_init_cookie_ttl_blank_falls_back(monkeypatch):
+    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "")
+    assert FetchClient()._cookie_ttl == 86400
+
+
+def test_init_cookie_ttl_negative_clamped(monkeypatch):
+    monkeypatch.delenv("FETCH_UX_COOKIE_TTL", raising=False)
+    assert FetchClient(cookie_ttl_sec=-5)._cookie_ttl == 0
+
+
 def test_init_headless_env_toggle(monkeypatch):
     monkeypatch.setenv("FETCH_UX_HEADLESS", "1")
     assert FetchClient()._headless is True
