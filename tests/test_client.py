@@ -95,15 +95,20 @@ async def test_scroll_action(client, local_server):
 
 @pytest.mark.asyncio
 async def test_stealth_fingerprints(client, local_server):
-    """Verify anti-detection measures are active."""
+    """Real Chrome (Patchright) presents a coherent fingerprint — no manual masks.
+
+    We assert the truthful signals real Chrome exposes, not the faked ones the
+    old init-script path injected. (window.chrome.runtime is intentionally NOT
+    asserted: real Chrome doesn't expose it on a plain page, and faking it was
+    itself a detectable tell — coherence over masking.)
+    """
     result = await client.fetch(f"{local_server}/stealth.html", max_length=50000)
     # Parse the JSON from the page
     data = json.loads(result.content.strip())
     assert data["webdriver"] is False, "navigator.webdriver should be false"
-    assert data["plugins_length"] > 0, "navigator.plugins should not be empty"
+    assert data["plugins_length"] > 0, "real Chrome exposes plugins"
     assert "en-US" in data["languages"], "navigator.languages should include en-US"
     assert data["chrome"] is True, "window.chrome should exist"
-    assert data["chrome_runtime"] is True, "window.chrome.runtime should exist"
 
 
 @pytest.mark.asyncio
