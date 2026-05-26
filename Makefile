@@ -17,8 +17,8 @@ help:
 setup:
 	@echo "→ Installing dependencies..."
 	@poetry install
-	@echo "→ Installing Patchright browsers..."
-	@poetry run patchright install chromium
+	@echo "→ Installing real Google Chrome (the one engine)..."
+	@poetry run patchright install chrome
 	@echo "✓ Setup complete"
 
 install: setup
@@ -46,7 +46,7 @@ server:
 	@mkdir -p logs
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 		echo "Starting mcp-fetch-ux on port $${PORT:-5006} (logs/server.log)..."; \
-		nohup poetry run python -m mcp_fetch_ux.server_http > logs/server.log 2>&1 & \
+		nohup xvfb-run -a poetry run python -m mcp_fetch_ux.server_http > logs/server.log 2>&1 & \
 		echo $$! > logs/server.pid
 	@sleep 3
 	@set -a; [ -f .env ] && . ./.env; set +a; \

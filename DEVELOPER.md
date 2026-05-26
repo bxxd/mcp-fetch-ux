@@ -22,6 +22,7 @@ mcp-fetch-ux/
 │   ├── fetch_ux/              Pure library (no MCP deps)
 │   │   ├── __init__.py
 │   │   └── client.py          FetchClient — Patchright + clipboard extraction
+│   │                           (real Chrome via Patchright, one persistent context)
 │   └── mcp_fetch_ux/          MCP server
 │       ├── __init__.py
 │       ├── __main__.py         Entry point
@@ -83,9 +84,11 @@ JS frameworks render asynchronously. The DOM loads fast but data arrives via API
 
 ### Browser lifecycle
 
-One Chromium instance for the lifetime of the server process (via Patchright). Each fetch creates a fresh `BrowserContext` (isolated cookies, storage, permissions) and closes it in a `finally` block. Clean state per request without browser restart overhead.
+One real Chrome (via Patchright `launch_persistent_context(channel="chrome")`) for the lifetime of the server process. One persistent context → a warm, **shared** cookie jar. Each fetch opens and closes a *page*, not a context; the context stays warm. `FETCH_UX_COOKIE_TTL` (default 1 day) throws the jar away on a timer via the recycle path, so a flagged session can't poison it forever.
 
-`asyncio.Semaphore(3)` limits concurrent fetches to prevent memory spikes.
+Trade-off of one shared context: cookies are shared across fetches (fine for public-page fetching; the daily TTL bounds it). The alternative — a fresh context per fetch — would give isolation but forfeits the warm jar and is not Patchright's recommended stealth config.
+
+`asyncio.Semaphore(3)` limits concurrent fetches to prevent memory spikes. The per-fetch page release is built by `_closer()`.
 
 ### Actions
 
@@ -137,27 +140,24 @@ Why not SSE? SSE sessions are in-memory. Server restart = dead sessions = `"Coul
 
 ## Browser Fingerprint Evasion
 
-Uses **Patchright** (drop-in Playwright replacement) + init scripts + header overrides to avoid headless detection.
+**Coherence over masking.** Real Google Chrome via Patchright's documented "completely undetected" config. We deliberately do **not** spoof anything by hand — layering manual patches on top of Patchright creates *inconsistencies* a fingerprinter catches (e.g. a faked NVIDIA WebGL string on a machine with no GPU). Real Chrome just tells the truth; there's nothing to catch.
 
-| Signal | Fix |
-|--------|-----|
-| CDP `Runtime.enable` leak | Patchright (patched Chromium) |
-| `__playwright__binding__` | Patchright (removed) |
-| `navigator.webdriver` | Patchright + init script (`false`) |
-| `Sec-Ch-Ua` / User-Agent | `extra_http_headers` matching real Chrome 145 on Linux |
-| WebGL renderer ("SwiftShader") | Init script spoofs NVIDIA string |
-| Empty `navigator.plugins` | Init script spoofs 5 plugins |
-| Missing `Accept-Language` | `extra_http_headers` + `locale="en-US"` |
-| `window.chrome` missing | Init script adds `chrome.runtime` etc. |
-| Permissions API inconsistencies | Init script overrides notification query |
-| Hardware fingerprints | Init script: `hardwareConcurrency=8`, `deviceMemory=8` |
-| Screen properties | Init script: `colorDepth=24`, `pixelDepth=24` |
-| Fixed viewport (1280x720) | Randomized per request (±40w, ±30h) |
-| Instant click timing | Mouse moves to target with 5-15 steps before click |
-| Fixed polling intervals | Jittered 400-600ms per poll, random pauses between actions |
-| `--enable-automation` flag | `--disable-blink-features=AutomationControlled` |
+| Concern | How it's handled |
+|---------|------------------|
+| CDP `Runtime.enable` / `Console.enable` leaks | Patchright (isolated execution contexts) |
+| `navigator.webdriver`, `--enable-automation` | Patchright sets the right args itself |
+| UA / `Sec-Ch-Ua` / client hints | real Chrome sends consistent, real values — no override |
+| `window.chrome`, plugins, permissions, hardware | real Chrome — nothing to mask |
+| WebGL renderer | real GPU via ANGLE/EGL when `/dev/dri/renderD128` exists (`--use-gl=angle --use-angle=gl-egl`); else Chrome's default |
+| Viewport | `no_viewport=True` — the real window size |
+| Instant click timing | mouse moves to target over 5-15 steps before click |
+| Fixed polling intervals | jittered 400-600ms per poll, random pauses between actions |
 
-**Not fixable server-side**: Datacenter IP detection (use residential proxy), TLS fingerprinting (Chromium's is fine).
+Config = `channel="chrome"`, `launch_persistent_context`, `no_viewport=True`, no header/UA/init-script injection. Requires real Chrome (`patchright install chrome`) and a display (run under `xvfb`; `FETCH_UX_HEADLESS=1` forces headless, which is more detectable).
+
+This beats Cloudflare/Datadome/Kasada-class walls. It does **not** beat Google's reCAPTCHA-Enterprise SERP wall — that scores the whole environment (GPU + Google account history + behavior), which a coherent-but-automated session can't satisfy from a single box. For a Firefox-based engine that does pass reCAPTCHA v3 (`invisible_playwright`), see the follow-up branch.
+
+**Not fixable here**: datacenter-IP reputation (use a residential egress).
 
 ## Configuration
 
@@ -174,7 +174,7 @@ No API keys. No secrets.
 ## Commands
 
 ```bash
-make setup     # poetry install + patchright install chromium
+make setup     # poetry install + patchright install chrome  (server runs under xvfb)
 make install   # setup + install 'fetch' CLI to ~/.local/bin/
 make server    # start (nohup, PID file, health check)
 make kill      # stop
@@ -189,7 +189,7 @@ poetry run pytest tests/ -v          # all tests (~80s, launches real browser)
 poetry run pytest tests/test_unit.py # fast, no browser
 ```
 
-- `test_unit.py` — pure functions: `_read_download`, `extract_content_from_html`, tool schema, routing
+- `test_unit.py` — pure functions: `_read_download`, FetchClient config + GPU args, tool schema, routing
 - `test_client.py` — real Patchright against local fixture server: content extraction, JS rendering, cookie dismissal, truncation/pagination, actions, stealth fingerprints, action discovery
 - `test_server.py` — HTTP endpoints: ping, MCP initialize, shutdown, 404
 
@@ -226,9 +226,9 @@ PDF downloads are automatically converted to text via `pdftotext`. Other binary 
 
 - **File downloads**: Detected via Patchright's download event. Content returned as text. Binary files (PDFs) returned with `errors="replace"` — good enough for text extraction, not for binary fidelity.
 
-- **Headless detection**: Patchright patches CDP leaks. Init scripts mask navigator/WebGL/plugins. Headers match real Chrome 145 on Linux. Reddit still blocks datacenter IPs regardless — use Grok for those.
+- **Bot detection**: real Chrome + Patchright present a coherent fingerprint (no manual masking). Beats Cloudflare/Datadome-class walls; not Google's reCAPTCHA-Enterprise SERP. Datacenter IPs still get blocked regardless — use a residential egress.
 
-- **Memory**: Each fetch creates and destroys a browser context. Semaphore caps at 3 concurrent. Monitor under heavy load.
+- **Memory**: one persistent context for the process; each fetch opens/closes a page. `FETCH_UX_COOKIE_TTL` recycles the whole context (fresh profile) on a timer. Semaphore caps at 3 concurrent. Monitor under heavy load.
 
 - **Timeouts**: 30s default on all Patchright operations. Actions get 5s each. No operation hangs indefinitely.
 

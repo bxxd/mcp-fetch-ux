@@ -6,7 +6,7 @@ Built because Claude Code's `WebFetch` [hangs indefinitely](https://github.com/a
 
 ## How it works
 
-1. **Playwright** launches headless Chromium and navigates to the URL
+1. **Patchright** launches real Google Chrome (headed under `xvfb`) and navigates to the URL
 2. Dismisses cookie/consent overlays automatically
 3. Waits for JS to render (polls until page content stabilizes)
 4. **Ctrl+A, Ctrl+C** — uses the clipboard API to capture all visible text, including content inside Shadow DOM
@@ -20,7 +20,7 @@ No LLM in the loop. No API costs. 30-second timeout.
 ```bash
 git clone https://github.com/bxxd/mcp-fetch-ux.git
 cd mcp-fetch-ux
-make install   # install deps + Chromium + 'fetch' CLI to ~/.local/bin/
+make install   # install deps + real Chrome + 'fetch' CLI to ~/.local/bin/  (run server under xvfb)
 ```
 
 ```bash
@@ -111,9 +111,22 @@ They don't render JavaScript. Roche's pipeline page returns an empty shell — t
 
 Tested [crawl4ai](https://github.com/unclecode/crawl4ai) (50K+ stars) on the same Roche pipeline page. It returns 7,220 chars with zero drug names — can't see inside Shadow DOM. This tool returns 11,224 chars with all 131 drugs.
 
+## Browser engine
+
+One engine, no fallback: **real Google Chrome** (`channel="chrome"`) via Patchright, in a single persistent context — a warm, shared cookie jar. **No** UA spoof, no `Sec-Ch-Ua` override, no `AutomationControlled` flag, no init-script masks: real Chrome + Patchright present a coherent fingerprint, and layering manual masks on top only creates detectable inconsistencies. This beats Cloudflare/Datadome-class walls; it does **not** beat Google's reCAPTCHA-Enterprise SERP (that scores the whole environment).
+
+Requires Chrome (`patchright install chrome`) and a display — run headed under `xvfb`.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `FETCH_UX_HEADLESS` | `0` | `1` → headless (more detectable; headed-under-xvfb is stealthier) |
+| `FETCH_UX_COOKIE_TTL` | `86400` | seconds before the shared cookie jar is thrown away and rebuilt |
+
+If a DRM render node (`/dev/dri/renderD128`) is present — e.g. a GPU passed into the container — Chrome drives WebGL through it via ANGLE/EGL, so the renderer reports the real GPU instead of `WebGL: false`. No-op without a GPU.
+
 ## Performance
 
-Browser launches once at server startup and stays alive. Each fetch opens a fresh context, fetches, closes.
+Chrome launches once at server startup and stays alive in one persistent context (shared cookie jar); each fetch opens and closes a page, not a context.
 
 | Phase | Time |
 |-------|------|

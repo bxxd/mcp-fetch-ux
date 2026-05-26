@@ -1,11 +1,10 @@
 """Unit tests — pure functions, no browser needed."""
 
 import tempfile
-from pathlib import Path
 
 import pytest
 
-from fetch_ux.client import _read_download, extract_content_from_html, FetchResult
+from fetch_ux.client import _read_download, FetchResult
 from mcp_fetch_ux.tools import TOOLS
 from mcp_fetch_ux.handlers import call_tool
 
@@ -40,26 +39,12 @@ def test_read_download_no_url_no_curl_hint():
     assert "curl -sL -o" not in result  # no specific curl command without URL
 
 
-# --- extract_content_from_html ---
-
-def test_extract_content_basic():
-    html = "<html><head><title>Test</title></head><body><p>Hello world</p></body></html>"
-    content, title = extract_content_from_html(html)
-    assert "Hello world" in content
-
-
-def test_extract_content_empty():
-    content, title = extract_content_from_html("<html><body></body></html>")
-    assert content == ""
-    assert title == ""
-
-
 # --- Tool schema ---
 
 def test_tool_schema_valid():
     assert len(TOOLS) == 1
     tool = TOOLS[0]
-    assert tool["name"] == "webfetch"
+    assert tool["name"] == "read_webpage"
     assert "url" in tool["inputSchema"]["properties"]
     assert "url" in tool["inputSchema"]["required"]
 
@@ -79,7 +64,7 @@ def test_tool_schema_constructs_as_mcp_tool():
     from mcp.types import Tool
     for t in TOOLS:
         tool = Tool(**t)
-        assert tool.name == "webfetch"
+        assert tool.name == "read_webpage"
 
 
 # --- handlers.call_tool routing ---
@@ -97,3 +82,80 @@ def test_fetch_result_defaults():
     assert r.status == 200
     assert r.download_filename is None
     assert r.actions_available is None
+
+
+# --- FetchClient config: real-Chrome engine + GPU args (no browser) ---
+
+import os
+
+from fetch_ux.client import FetchClient
+
+
+def test_chrome_args_empty_without_render_node(monkeypatch):
+    """No DRM render node → no GPU flags (safe no-op on GPU-less hosts)."""
+    monkeypatch.setattr(os.path, "exists", lambda p: False)
+    assert FetchClient._chrome_args() == []
+
+
+def test_chrome_args_present_with_render_node(monkeypatch):
+    """Render node present → drive WebGL through it via ANGLE/EGL."""
+    monkeypatch.setattr(os.path, "exists", lambda p: p == "/dev/dri/renderD128")
+    args = FetchClient._chrome_args()
+    assert "--use-gl=angle" in args
+    assert "--use-angle=gl-egl" in args
+
+
+def test_init_defaults(monkeypatch):
+    """Unset env → headed (xvfb-friendly) with a 1-day cookie TTL."""
+    monkeypatch.delenv("FETCH_UX_HEADLESS", raising=False)
+    monkeypatch.delenv("FETCH_UX_COOKIE_TTL", raising=False)
+    c = FetchClient()
+    assert c._headless is False
+    assert c._cookie_ttl == 86400
+
+
+def test_init_explicit_args_win_over_env(monkeypatch):
+    """Explicit kwargs override env vars."""
+    monkeypatch.setenv("FETCH_UX_HEADLESS", "0")
+    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "999")
+    c = FetchClient(headless=True, cookie_ttl_sec=123)
+    assert c._headless is True
+    assert c._cookie_ttl == 123
+
+
+def test_init_cookie_ttl_from_env(monkeypatch):
+    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "3600")
+    assert FetchClient()._cookie_ttl == 3600
+
+
+def test_init_cookie_ttl_garbage_falls_back(monkeypatch):
+    """Non-integer env must not crash client creation."""
+    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "1h")
+    assert FetchClient()._cookie_ttl == 86400
+
+
+def test_init_cookie_ttl_blank_falls_back(monkeypatch):
+    monkeypatch.setenv("FETCH_UX_COOKIE_TTL", "")
+    assert FetchClient()._cookie_ttl == 86400
+
+
+def test_init_cookie_ttl_negative_clamped(monkeypatch):
+    monkeypatch.delenv("FETCH_UX_COOKIE_TTL", raising=False)
+    assert FetchClient(cookie_ttl_sec=-5)._cookie_ttl == 0
+
+
+def test_init_headless_env_toggle(monkeypatch):
+    monkeypatch.setenv("FETCH_UX_HEADLESS", "1")
+    assert FetchClient()._headless is True
+
+
+def test_remove_dir_safe_on_none():
+    FetchClient._remove_dir(None)  # must not raise
+
+
+def test_remove_dir_removes_profile(tmp_path):
+    d = tmp_path / "profile"
+    d.mkdir()
+    (d / "cookies").write_text("x")
+    FetchClient._remove_dir(str(d))
+    assert not d.exists()
