@@ -1,12 +1,13 @@
 """Unit tests — pure functions, no browser needed."""
 
+import os
 import tempfile
 
 import pytest
 
-from fetch_ux.client import _read_download, FetchResult
+from fetch_ux.client import _read_download, FetchClient, FetchResult
 from mcp_fetch_ux.tools import TOOLS
-from mcp_fetch_ux.handlers import call_tool
+from mcp_fetch_ux.handlers import call_tool, _validate_url, UnsafeUrl
 
 
 # --- _read_download ---
@@ -86,10 +87,6 @@ def test_fetch_result_defaults():
 
 # --- FetchClient config: real-Chrome engine + GPU args (no browser) ---
 
-import os
-
-from fetch_ux.client import FetchClient
-
 
 def test_chrome_args_empty_without_render_node(monkeypatch):
     """No DRM render node → no GPU flags (safe no-op on GPU-less hosts)."""
@@ -159,3 +156,35 @@ def test_remove_dir_removes_profile(tmp_path):
     (d / "cookies").write_text("x")
     FetchClient._remove_dir(str(d))
     assert not d.exists()
+
+
+# --- _validate_url (SSRF guard) — IP literals/scheme/hostname need no DNS ---
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "file:///etc/passwd",
+    "ftp://example.com",
+    "gopher://example.com",
+    "http://localhost/",
+    "http://foo.local/",
+    "http://bar.internal/",
+    "http://127.0.0.1/",
+    "http://10.0.0.1/",
+    "http://192.168.1.1/",
+    "http://172.16.0.1/",
+    "http://169.254.169.254/latest/meta-data/",  # cloud metadata
+    "http://[::1]/",
+    "https://0.0.0.0/",
+])
+async def test_validate_url_rejects_unsafe(url):
+    with pytest.raises(UnsafeUrl):
+        await _validate_url(url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "http://8.8.8.8/",       # public IP literal — no DNS needed
+    "https://1.1.1.1/",
+])
+async def test_validate_url_allows_public_ip(url):
+    assert await _validate_url(url) is None

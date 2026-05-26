@@ -9,7 +9,14 @@ WorkingDirectory=/home/ubuntu/work/dev/mcp-fetch-ux
 Environment=PORT=5017
 Environment=HOME=/home/ubuntu
 Environment=PATH=/home/ubuntu/.cache/pypoetry/virtualenvs/mcp-fetch-ux-TM0Unpyq-py3.12/bin:/usr/bin
-ExecStart=/home/ubuntu/.cache/pypoetry/virtualenvs/mcp-fetch-ux-TM0Unpyq-py3.12/bin/python -m mcp_fetch_ux.server_http
+# Optional per-host overrides (PORT, FETCH_UX_HEADLESS, the venv path, etc.).
+# The "-" makes it non-fatal if absent.
+EnvironmentFile=-/etc/default/mcp-fetch-ux
+# The engine runs real Chrome headed → needs a display. xvfb-run supplies a
+# virtual one. (Alternatively set FETCH_UX_HEADLESS=1, with the detectability
+# trade-off noted in the docs.) The venv path below is host-specific — override
+# via EnvironmentFile on other machines.
+ExecStart=/usr/bin/xvfb-run -a /home/ubuntu/.cache/pypoetry/virtualenvs/mcp-fetch-ux-TM0Unpyq-py3.12/bin/python -m mcp_fetch_ux.server_http
 Restart=on-failure
 RestartSec=5
 # Patchright wants this for chromium sandbox

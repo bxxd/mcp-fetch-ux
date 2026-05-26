@@ -91,6 +91,37 @@ async def handle_ping(request: Request):
     return JSONResponse({"status": "ok"})
 
 
+def _coerce_int(v, default):
+    """JSON int with serde-null tolerance; raise ValueError on a bad type."""
+    if v is None:
+        return default
+    if isinstance(v, bool):  # bool is an int subclass — reject to avoid True->1
+        raise ValueError("expected an integer")
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except ValueError:
+            raise ValueError(f"invalid integer: {v!r}")
+    raise ValueError("expected an integer")
+
+
+def _coerce_bool(v, default):
+    """JSON bool with serde-null tolerance; parse strings, raise on a bad type."""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes"):
+            return True
+        if s in ("false", "0", "no", ""):
+            return False
+    raise ValueError(f"invalid boolean: {v!r}")
+
+
 async def handle_fetch_json(request: Request):
     """Raw JSON fetch endpoint.
 
@@ -112,29 +143,35 @@ async def handle_fetch_json(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
     url = body.get("url")
     if not url or not isinstance(url, str):
         return JSONResponse({"error": "missing or invalid 'url'"}, status_code=400)
-    # Tolerate explicit nulls (Rust's serde serializes Option::None as null,
-    # not as a missing field) and treat them as "use default".
-    def _or_default(key, default):
-        v = body.get(key)
-        return default if v is None else v
+
+    # Coerce optional params (serde sends Option::None as null); 400 on bad types.
+    try:
+        max_length = _coerce_int(body.get("max_length"), 50000)
+        start_index = _coerce_int(body.get("start_index"), 0)
+        raw = _coerce_bool(body.get("raw"), False)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
     try:
         content = await handlers.handle_fetch(
             url=url,
             actions=body.get("actions"),
-            max_length=int(_or_default("max_length", 50000)),
-            start_index=int(_or_default("start_index", 0)),
-            raw=bool(_or_default("raw", False)),
+            max_length=max_length,
+            start_index=start_index,
+            raw=raw,
         )
         return JSONResponse({"content": content})
     except handlers.UnsafeUrl as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
+    except Exception:
+        # Don't leak internals (paths, versions) to the client; log for debugging.
         logger.exception("handle_fetch_json failed")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": "internal error"}, status_code=500)
 
 
 async def handle_shutdown(request: Request):

@@ -40,3 +40,33 @@ def test_shutdown_endpoint(http_client):
 def test_unknown_route_404(http_client):
     resp = http_client.get("/nonexistent")
     assert resp.status_code == 404
+
+
+# --- /fetch JSON endpoint: 400 paths (no browser; validation precedes launch) ---
+
+def test_fetch_invalid_json(http_client):
+    resp = http_client.post("/fetch", content=b"not json")
+    assert resp.status_code == 400
+    assert "error" in resp.json()
+
+
+def test_fetch_non_object_body(http_client):
+    resp = http_client.post("/fetch", json=["not", "an", "object"])
+    assert resp.status_code == 400
+
+
+def test_fetch_missing_url(http_client):
+    resp = http_client.post("/fetch", json={"max_length": 100})
+    assert resp.status_code == 400
+
+
+def test_fetch_bad_max_length_type(http_client):
+    resp = http_client.post("/fetch", json={"url": "http://example.com", "max_length": "50k"})
+    assert resp.status_code == 400
+
+
+def test_fetch_unsafe_url_rejected(http_client):
+    # _validate_url rejects localhost before any browser launch → 400, not 500.
+    resp = http_client.post("/fetch", json={"url": "http://localhost/"})
+    assert resp.status_code == 400
+    assert "error" in resp.json()

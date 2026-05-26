@@ -1,5 +1,6 @@
 """Tool routing and execution."""
 
+import asyncio
 import ipaddress
 import logging
 import socket
@@ -41,7 +42,7 @@ def _is_blocked_ip(ip_str: str) -> bool:
     )
 
 
-def _validate_url(url: str) -> None:
+async def _validate_url(url: str) -> None:
     """Raise UnsafeUrl if `url` points anywhere we refuse to fetch."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -63,10 +64,13 @@ def _validate_url(url: str) -> None:
         return
     except ValueError:
         pass
-    # Resolve DNS. Reject if ANY address is blocked.
+    # Resolve DNS off the event loop (getaddrinfo is blocking). Reject if ANY
+    # resolved address is blocked.
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )
     except socket.gaierror as e:
         raise UnsafeUrl(f"host did not resolve: {e}") from e
     for info in infos:
@@ -107,11 +111,11 @@ async def handle_fetch(
     start_index: int = 0,
     raw: bool = False,
 ) -> str:
-    """Fetch URL with Playwright, optionally interact, return content."""
+    """Fetch URL with real Chrome (Patchright), optionally interact, return content."""
     # Defense in depth: the Rust edge does this too, but anyone hitting the
     # Python worker directly (or via MCP without going through the edge) is
     # still protected here.
-    _validate_url(url)
+    await _validate_url(url)
 
     client = await get_client()
 
