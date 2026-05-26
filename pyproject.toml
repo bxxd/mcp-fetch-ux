@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "mcp-fetch-ux"
 version = "0.1.0"
-description = "Playwright-based web fetch MCP server with Readability extraction"
+description = "Real-Chrome (Patchright) web-fetch MCP server with clipboard extraction"
 authors = ["idio"]
 license = "MIT"
 readme = "DEVELOPER.md"
@@ -13,8 +13,6 @@ packages = [
 [tool.poetry.dependencies]
 python = "^3.11"
 playwright = "^1.49"
-markdownify = ">=0.13.1"
-readabilipy = ">=0.2.0"
 mcp = "^1.0.0"
 starlette = "^0.41.0"
 uvicorn = "^0.32.0"

@@ -7,14 +7,16 @@ Supports page interactions (click, fill, wait) and file downloads.
 
 import asyncio
 import logging
+import os
 import random
+import shutil
 import subprocess
-from dataclasses import dataclass, field
+import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
-import markdownify
-import readabilipy.simple_json
-from patchright.async_api import async_playwright, Browser, Download
+from patchright.async_api import async_playwright, Download
 
 logger = logging.getLogger("fetch_ux")
 
@@ -61,85 +63,127 @@ def _read_download(path: str, filename: str | None, url: str | None = None) -> s
         return f.read()
 
 
-def extract_content_from_html(html: str) -> tuple[str, str]:
-    """Extract article content from HTML using Readability, convert to markdown."""
-    ret = readabilipy.simple_json.simple_json_from_html_string(
-        html, use_readability=True
-    )
-    if not ret["content"]:
-        return "", ""
-    content = markdownify.markdownify(
-        ret["content"],
-        heading_style=markdownify.ATX,
-    )
-    title = ret.get("title") or ""
-    return content, title
-
-
 class FetchClient:
-    """Fetches URLs with Playwright (JS rendering) + clipboard extraction."""
+    """Fetches URLs with real Chrome (Patchright) + clipboard extraction.
 
-    def __init__(self, timeout_ms: int = 60_000, user_agent: str | None = None):
+    One engine, no fallback: real Google Chrome via a persistent context. Needs
+    Chrome installed (`patchright install chrome`) and a display — run headed under
+    xvfb on a server; `FETCH_UX_HEADLESS=1` forces headless (more detectable).
+    """
+
+    def __init__(
+        self,
+        timeout_ms: int = 60_000,
+        *,
+        headless: bool | None = None,
+        cookie_ttl_sec: int | None = None,
+    ):
         self.timeout_ms = timeout_ms
-        self.user_agent = user_agent or (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        # Patchright is most undetectable headed (run under xvfb); headless is more
+        # detectable. Default headed.
+        self._headless = (
+            headless if headless is not None
+            else os.environ.get("FETCH_UX_HEADLESS", "0") == "1"
         )
-        self._browser: Browser | None = None
+        # Throw the shared cookie jar away on a timer so one flagged session can't
+        # poison us forever. Routed through the recycle path. 0 = never.
+        self._cookie_ttl = (
+            cookie_ttl_sec if cookie_ttl_sec is not None
+            else int(os.environ.get("FETCH_UX_COOKIE_TTL", "86400"))
+        )
+        self._context = None          # persistent BrowserContext — the one engine
+        self._user_data_dir: str | None = None
+        self._context_born: float = 0.0
         self._pw = None
         self._semaphore = asyncio.Semaphore(3)
         self._needs_restart = False
         self._recycle_lock = asyncio.Lock()
 
     async def start(self):
-        """Launch browser. Call once at server startup."""
+        """Launch real Chrome once. Call at server startup.
+
+        One persistent context (real Google Chrome via channel="chrome") = a warm,
+        shared cookie jar. No UA spoof, no Sec-CH-UA, no AutomationControlled flag,
+        no init scripts: real Chrome + Patchright present a coherent fingerprint;
+        layering manual masks on top only creates detectable inconsistencies.
+        """
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-gpu",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disk-cache-size=1",
-                "--media-cache-size=1",
-                "--aggressive-cache-discard",
-            ],
+        # Fresh profile dir each launch → recycling (incl. the daily TTL) wipes
+        # cookies for free.
+        self._user_data_dir = tempfile.mkdtemp(prefix="fetchux-chrome-")
+        self._context = await self._pw.chromium.launch_persistent_context(
+            self._user_data_dir,
+            channel="chrome",          # real Google Chrome, not bundled Chromium
+            headless=self._headless,
+            no_viewport=True,          # use the real window size; don't fingerprint
+            locale="en-US",
+            permissions=["clipboard-read", "clipboard-write"],
+            accept_downloads=True,
+            args=self._chrome_args(),
         )
+        self._context.set_default_timeout(self.timeout_ms)
+        self._context_born = time.monotonic()
+        logger.info(
+            "FetchClient: Chrome up (channel=chrome, headless=%s, profile=%s)",
+            self._headless, self._user_data_dir,
+        )
+
+    @staticmethod
+    def _remove_dir(path: str | None):
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
+
+    @staticmethod
+    def _chrome_args() -> list[str]:
+        """If a DRM render node is present (a GPU was passed into the container),
+        drive WebGL through it via ANGLE/EGL so the renderer reports the real GPU
+        instead of 'WebGL: False' — a glaring automation tell. No-op without a GPU,
+        so this stays safe on GPU-less hosts."""
+        if os.path.exists("/dev/dri/renderD128"):
+            return [
+                "--use-gl=angle",
+                "--use-angle=gl-egl",   # ANGLE over native EGL → Mesa iris → render node
+                "--ignore-gpu-blocklist",
+                "--enable-gpu-rasterization",
+            ]
+        return []
 
     async def stop(self):
         """Close browser. Call at server shutdown."""
-        if self._browser:
+        if self._context:
             try:
-                await asyncio.wait_for(self._browser.close(), timeout=5.0)
+                await asyncio.wait_for(self._context.close(), timeout=5.0)
             except Exception:
                 pass
         if self._pw:
             await self._pw.stop()
+        self._remove_dir(self._user_data_dir)
 
     async def _recycle_browser(self):
-        """Swap in a fresh browser to flush stuck renderers.
+        """Swap in a fresh context — to flush a stuck renderer, and to throw the
+        cookie jar away when the TTL expires (which routes here too).
 
-        Saves old browser references, starts a new browser (new fetches use it
-        immediately), then closes the old one. In-flight fetches on the old browser
-        complete naturally on their existing contexts.
+        Starts fresh (new fetches use it immediately), then closes the old one.
+        In-flight fetches finish naturally on the old context.
         """
-        logger.warning("Recycling browser — flushing stuck renderer")
-        old_browser, old_pw = self._browser, self._pw
+        logger.warning("Recycling Chrome — flushing renderer / rotating cookies")
+        old_ctx, old_pw, old_dir = self._context, self._pw, self._user_data_dir
+        self._context = None
         self._needs_restart = False
         try:
             await self.start()
         except Exception:
-            self._browser, self._pw = old_browser, old_pw
+            self._context, self._pw, self._user_data_dir = old_ctx, old_pw, old_dir
             self._needs_restart = True
             raise
-        if old_browser:
+        if old_ctx:
             try:
-                await asyncio.wait_for(old_browser.close(), timeout=5.0)
+                await asyncio.wait_for(old_ctx.close(), timeout=5.0)
             except Exception:
                 pass
         if old_pw:
             await old_pw.stop()
+        self._remove_dir(old_dir)  # discard the old cookie profile
 
     async def fetch(
         self,
@@ -158,8 +202,17 @@ class FetchClient:
             start_index: Start content extraction at this char index.
             raw: Return raw HTML instead of clipboard text.
         """
-        if not self._browser:
+        if self._context is None:
             await self.start()
+
+        # Daily cookie throw-away: expire the warm jar so a flagged session can't
+        # poison us forever. Routes through the same recycle path as stuck renderers.
+        if (
+            self._cookie_ttl > 0
+            and self._context_born
+            and time.monotonic() - self._context_born > self._cookie_ttl
+        ):
+            self._needs_restart = True
 
         if self._needs_restart:
             async with self._recycle_lock:
@@ -175,6 +228,27 @@ class FetchClient:
             except asyncio.TimeoutError:
                 raise TimeoutError(f"Timed out after {self.timeout_ms // 1000}s fetching {url}")
 
+    def _closer(self, closeable, kind: str):
+        """Build the per-fetch release coroutine; on a close hang, flag a recycle."""
+        async def _release(url: str = ""):
+            try:
+                await asyncio.wait_for(closeable.close(), timeout=5.0)
+            except Exception:
+                if not self._recycle_lock.locked():
+                    self._needs_restart = True
+                logger.warning("%s.close() timed out for %s — scheduling recycle", kind, url)
+        return _release
+
+    async def _acquire_page(self):
+        """Open a page on the warm persistent context (shared cookie jar). The
+        context stays alive; only the page is closed after the fetch."""
+        page = await self._context.new_page()
+        try:
+            page.set_default_timeout(self.timeout_ms)
+        except Exception:
+            pass
+        return page, self._closer(page, "page")
+
     async def _fetch_impl(
         self,
         url: str,
@@ -183,81 +257,11 @@ class FetchClient:
         start_index: int,
         raw: bool,
     ) -> FetchResult:
-        # Randomize viewport slightly — fixed 1280x720 is a bot fingerprint
-        vw = 1280 + random.randint(-40, 40)
-        vh = 720 + random.randint(-30, 30)
-
-        context = await self._browser.new_context(
-            user_agent=self.user_agent,
-            viewport={"width": vw, "height": vh},
-            screen={"width": 1920, "height": 1080},
-            permissions=["clipboard-read", "clipboard-write"],
-            accept_downloads=True,
-            locale="en-US",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Linux"',
-                "DNT": "1",
-            },
-        )
-        context.set_default_timeout(self.timeout_ms)
-
-        # Mask headless fingerprints before any page loads
-        await context.add_init_script("""
-            // navigator.webdriver — biggest headless tell
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-
-            // navigator.plugins — empty in headless
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5],
-            });
-
-            // navigator.languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en'],
-            });
-
-            // window.chrome runtime
-            if (!window.chrome) {
-                window.chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}) };
-            }
-
-            // WebGL — mask SwiftShader
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Google Inc. (NVIDIA)';
-                if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Direct3D11 vs_5_0 ps_5_0)';
-                return getParameter.call(this, parameter);
-            };
-
-            // Permissions API — headless returns 'denied' for notifications
-            const originalQuery = window.Permissions?.prototype?.query;
-            if (originalQuery) {
-                window.Permissions.prototype.query = function(parameters) {
-                    if (parameters.name === 'notifications') {
-                        return Promise.resolve({ state: Notification.permission });
-                    }
-                    return originalQuery.call(this, parameters);
-                };
-            }
-
-            // Hardware fingerprints — headless defaults are suspicious
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-
-            // Screen properties — match the screen size we set on the context
-            Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
-            Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
-        """)
-
         download_file: Download | None = None
         download_content: str | None = None
 
+        page, _release_page = await self._acquire_page()
         try:
-            page = await context.new_page()
-
             # Listen for downloads
             page.on("download", lambda d: _capture_download(d))
 
@@ -343,12 +347,7 @@ class FetchClient:
             # Discover available actions on the page
             actions_available = await self._discover_actions(page)
         finally:
-            try:
-                await asyncio.wait_for(context.close(), timeout=5.0)
-            except Exception:
-                if not self._recycle_lock.locked():
-                    self._needs_restart = True
-                logger.warning(f"context.close() timed out for {url} — scheduling browser recycle")
+            await _release_page(url)
 
         original_length = len(content)
         truncated = False
@@ -506,7 +505,7 @@ class FetchClient:
                     pass  # Best-effort — proceed to click even if move fails
                 # Check if click triggers a download
                 try:
-                    async with page.expect_download(timeout=timeout) as dl_info:
+                    async with page.expect_download(timeout=timeout):
                         await loc.click(timeout=timeout)
                     # Download was triggered — it's captured by the event listener
                     return
