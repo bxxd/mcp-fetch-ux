@@ -1,12 +1,14 @@
-"""Stealth-Firefox web fetcher with clipboard extraction.
+"""Engine-agnostic web fetcher with clipboard extraction.
 
-Renders JS, captures visible text (including Shadow DOM) via Ctrl+A/Ctrl+C.
-Supports page interactions (click, fill, wait) and file downloads.
-30s timeout. No LLM. No cost.
+Renders JS, captures visible text (including closed Shadow DOM) via Ctrl+A/Ctrl+C,
+runs page interactions (click, fill, wait), and returns file downloads. No LLM,
+no cost. This core holds zero browser-specific code.
 
-Engine: invisible_playwright — a C++-fingerprint-patched Firefox that passes
-reCAPTCHA v3 (including Google SERP), where Chromium-based stealth hits a
-ceiling. Drop-in Playwright API. Needs a display — run headed under xvfb.
+The browser is a swappable port (`fetch_ux.engines`, picked via FETCH_UX_ENGINE):
+- `invisible` (default) — a C++-fingerprint-patched Firefox that passes reCAPTCHA v3
+  including Google SERP, where Chromium-based stealth hits a ceiling.
+- `chrome` — real Google Chrome via Patchright, for Cloudflare/Datadome-class walls.
+Both drive a real browser headed, so they need a display — run under xvfb.
 """
 
 import asyncio
