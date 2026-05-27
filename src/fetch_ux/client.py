@@ -111,8 +111,9 @@ class FetchClient:
         # Size the fetch gate from what the engine declares it can safely run at once
         # (invisible=1: single Firefox deadlocks on concurrent target creation;
         # chrome=3: Chromium isolates per context). Falls back to 1 for any engine
-        # that doesn't declare it.
-        self._semaphore = asyncio.Semaphore(getattr(self._engine, "concurrency", 1))
+        # that doesn't declare it. Stored so recycle can drain exactly this many.
+        self._concurrency = getattr(self._engine, "concurrency", 1)
+        self._semaphore = asyncio.Semaphore(self._concurrency)
         self._needs_restart = False
         self._recycle_lock = asyncio.Lock()
 
@@ -130,19 +131,34 @@ class FetchClient:
             self._started = False
 
     async def _recycle_browser(self):
-        """Flush a stuck renderer / rotate the session: stop then restart the
-        engine. New fetches use the fresh browser immediately."""
-        logger.warning(
-            "Recycling engine=%s — flushing renderer / rotating session",
-            getattr(self._engine, "name", "?"),
-        )
-        self._needs_restart = False
+        """Flush a stuck renderer / rotate the session: stop then restart the engine.
+
+        Drains the fetch gate first — acquires every semaphore permit so no fetch is
+        inside `_fetch_impl` when we stop the browser. Otherwise stopping invalidates
+        the pages those in-flight fetches hold, failing unrelated requests. In-flight
+        fetches finish and release their permits; new ones block on the gate until the
+        fresh browser is up. (The triggering fetch hasn't taken its permit yet — it
+        acquires the gate only after this returns — so there's no self-deadlock.)
+        """
+        acquired = 0
         try:
-            await self._engine.stop()
-        except Exception:
-            pass
-        await self._engine.start()
-        self._born = asyncio.get_event_loop().time()
+            for _ in range(self._concurrency):
+                await self._semaphore.acquire()
+                acquired += 1
+            logger.warning(
+                "Recycling engine=%s — flushing renderer / rotating session",
+                getattr(self._engine, "name", "?"),
+            )
+            self._needs_restart = False
+            try:
+                await self._engine.stop()
+            except Exception:
+                pass
+            await self._engine.start()
+            self._born = asyncio.get_event_loop().time()
+        finally:
+            for _ in range(acquired):
+                self._semaphore.release()
 
     async def fetch(
         self,

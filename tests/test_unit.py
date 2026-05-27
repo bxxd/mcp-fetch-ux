@@ -1,5 +1,6 @@
 """Unit tests — pure functions, no browser needed."""
 
+import asyncio
 import os
 import tempfile
 
@@ -175,6 +176,51 @@ def test_recycle_ttl_garbage_falls_back(monkeypatch):
 
 def test_recycle_ttl_negative_clamped():
     assert FetchClient(engine=object(), recycle_ttl_sec=-5)._recycle_ttl == 0
+
+
+# --- recycle drains the fetch gate (don't stop the browser mid-fetch) ---
+
+class _FakeEngine:
+    """Records start/stop calls; `concurrency` drives the client's fetch gate."""
+    name = "fake"
+    concurrency = 2
+
+    def __init__(self):
+        self.started = 0
+        self.stopped = 0
+
+    async def start(self):
+        self.started += 1
+
+    async def stop(self):
+        self.stopped += 1
+
+
+@pytest.mark.asyncio
+async def test_recycle_waits_for_inflight_fetches():
+    """_recycle_browser must not stop the engine while a fetch is mid-flight (its
+    page would be invalidated). It drains every semaphore permit first, so an
+    in-flight fetch holding a permit blocks the recycle until it finishes."""
+    eng = _FakeEngine()
+    client = FetchClient(engine=eng)
+    assert client._concurrency == 2
+
+    # Simulate one in-flight fetch holding a permit.
+    await client._semaphore.acquire()
+
+    recycle = asyncio.create_task(client._recycle_browser())
+    await asyncio.sleep(0.05)  # let recycle try to drain
+    # It can't acquire both permits (we hold one), so it must NOT have stopped yet.
+    assert eng.stopped == 0
+    assert not recycle.done()
+
+    # The in-flight fetch completes → releases its permit.
+    client._semaphore.release()
+    await asyncio.wait_for(recycle, timeout=1.0)
+
+    assert eng.stopped == 1 and eng.started == 1
+    # Every permit released back — normal fetching resumes.
+    assert client._semaphore._value == 2
 
 
 # --- _validate_url (SSRF guard) — IP literals/scheme/hostname need no DNS ---
