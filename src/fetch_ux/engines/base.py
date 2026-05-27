@@ -4,6 +4,12 @@ the engine-specific clipboard read-back (capture_text)."""
 
 
 class BaseEngine:
+    # Max concurrent fetches this engine can safely run; the client sizes its fetch
+    # semaphore from this. Default 1 (the safe floor): an engine driving a single
+    # browser process may deadlock on concurrent target creation or share a global
+    # OS clipboard. Engines that isolate per browser-context (e.g. Chromium) raise it.
+    concurrency = 1
+
     # Cookie/consent overlay buttons, tried in order; the first visible one is
     # clicked. Engine-agnostic — same recipe for Chrome and Firefox.
     _OVERLAY_SELECTORS = [

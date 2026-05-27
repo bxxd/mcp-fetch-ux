@@ -1,15 +1,15 @@
 # mcp-fetch-ux
 
-MCP server that fetches web pages using a real browser. Renders JavaScript, pierces Shadow DOM, returns clean text. Can interact with pages — click buttons, fill forms, download files.
+MCP server that fetches web pages using a **real, stealth browser**. Renders JavaScript, pierces Shadow DOM, returns clean text — and gets through bot walls that block everything else, **including live Google Search results**. Can interact with pages — click buttons, fill forms, download files.
 
-Built because Claude Code's `WebFetch` [hangs indefinitely](https://github.com/anthropics/claude-code/issues/34565) on slow sites with no timeout, and existing fetch tools can't see inside Shadow DOM.
+Built because Claude Code's `WebFetch` [hangs indefinitely](https://github.com/anthropics/claude-code/issues/34565) on slow sites with no timeout, and existing fetch tools can't see inside Shadow DOM (or get captcha'd the moment they try).
 
 ## How it works
 
-1. **Patchright** launches real Google Chrome (headed under `xvfb`) and navigates to the URL
-2. Dismisses cookie/consent overlays automatically
+1. A **stealth browser** launches headed under `xvfb` and navigates to the URL — by default a fingerprint-patched Firefox that passes reCAPTCHA; swappable to real Chrome (see [Browser engine](#browser-engine))
+2. Dismisses cookie/consent overlays automatically (including late, JS-injected banners)
 3. Waits for JS to render (polls until page content stabilizes)
-4. **Ctrl+A, Ctrl+C** — uses the clipboard API to capture all visible text, including content inside Shadow DOM
+4. **Ctrl+A, Ctrl+C** — selects and copies the rendered page, capturing all visible text including content inside (closed) Shadow DOM
 5. Discovers available actions (buttons, links, inputs) and returns them as hints
 6. Optionally runs actions (click, fill, wait) — if a click triggers a download, returns the file content
 
@@ -20,7 +20,8 @@ No LLM in the loop. No API costs. 30-second timeout.
 ```bash
 git clone https://github.com/bxxd/mcp-fetch-ux.git
 cd mcp-fetch-ux
-make install   # install deps + real Chrome + 'fetch' CLI to ~/.local/bin/  (run server under xvfb)
+make install   # deps + the invisible engine (stealth Firefox) + 'fetch' CLI to ~/.local/bin/
+# (optional) the chrome engine too:  make chrome
 ```
 
 ```bash
@@ -105,7 +106,7 @@ They don't render JavaScript. Roche's pipeline page returns an empty shell — t
 
 ## Why not innerText or Readability?
 
-`page.innerText('body')` and `document.getSelection()` don't cross Shadow DOM boundaries. Readability can't see JS-rendered content. The clipboard API captures exactly what a user gets when they Ctrl+A, Ctrl+C in Chrome — the only reliable way to get all visible text from modern web pages.
+`page.innerText('body')` and `document.getSelection()` don't cross Shadow DOM boundaries. Readability can't see JS-rendered content. The clipboard route captures exactly what a user gets when they Ctrl+A, Ctrl+C in a real browser — the only reliable way to get all visible text (including *closed* Shadow DOM) from modern web pages.
 
 ## Why not crawl4ai?
 
@@ -113,20 +114,26 @@ Tested [crawl4ai](https://github.com/unclecode/crawl4ai) (50K+ stars) on the sam
 
 ## Browser engine
 
-One engine, no fallback: **real Google Chrome** (`channel="chrome"`) via Patchright, in a single persistent context — a warm, shared cookie jar. **No** UA spoof, no `Sec-Ch-Ua` override, no `AutomationControlled` flag, no init-script masks: real Chrome + Patchright present a coherent fingerprint, and layering manual masks on top only creates detectable inconsistencies. This beats Cloudflare/Datadome-class walls; it does **not** beat Google's reCAPTCHA-Enterprise SERP (that scores the whole environment).
+The browser is a **swappable engine** — pick with `FETCH_UX_ENGINE`:
 
-Requires Chrome (`patchright install chrome`) and a display — run headed under `xvfb`.
+| Engine | Best for | How |
+|--------|----------|-----|
+| **`invisible`** (default) | hard targets, **incl. Google SERP** | Fingerprint-patched Firefox ([invisible_playwright](https://github.com/feder-cr/invisible_playwright)). Patches navigator / GPU / canvas / fonts / audio at the **C++ level** — no JS shims to detect — and passes reCAPTCHA v3 where Chromium-based stealth hits a ceiling. |
+| **`chrome`** | Cloudflare / Datadome / Kasada-class walls | Real Google Chrome via Patchright + a warm persistent context. Coherent fingerprint, zero manual masks. Does **not** beat Google's reCAPTCHA SERP. Install its browser with `make chrome`. |
+
+Both run a real browser headed, so they need a display — run under `xvfb` (the systemd unit and `cli` already do). `make setup` installs only the default (invisible) engine's browser; `make chrome` adds Chrome.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `FETCH_UX_HEADLESS` | `0` | `1` → headless (more detectable; headed-under-xvfb is stealthier) |
-| `FETCH_UX_COOKIE_TTL` | `86400` | seconds before the shared cookie jar is thrown away and rebuilt |
+| `FETCH_UX_ENGINE` | `invisible` | set to `chrome` for the Patchright/Chrome engine |
+| `FETCH_UX_RECYCLE_TTL` | `86400` | seconds before the browser is recycled (rotates cookies / fingerprint); `0` = never |
+| `FETCH_UX_HEADLESS` | `0` | `1` → headless (more detectable; headed-under-xvfb is stealthier) — chrome engine |
 
-If a DRM render node (`/dev/dri/renderD128`) is present — e.g. a GPU passed into the container — Chrome drives WebGL through it via ANGLE/EGL, so the renderer reports the real GPU instead of `WebGL: false`. No-op without a GPU.
+GPU: with a DRM render node (`/dev/dri/renderD128`) present — e.g. a GPU passed into the container — the chrome engine drives WebGL through it via ANGLE/EGL, so the renderer reports the real GPU instead of `WebGL: false`. No-op without a GPU.
 
 ## Performance
 
-Chrome launches once at server startup and stays alive in one persistent context (shared cookie jar); each fetch opens and closes a page, not a context.
+The browser launches once at server startup and stays warm; each fetch opens and closes a page.
 
 | Phase | Time |
 |-------|------|
@@ -134,10 +141,11 @@ Chrome launches once at server startup and stays alive in one persistent context
 | JS render + stabilization | ~1-3s |
 | Total per fetch | ~3-5s |
 
-Concurrency limited to 3 simultaneous fetches.
+Concurrency is per-engine: **invisible** runs fetches one at a time (a single Firefox can't safely open targets in parallel), **chrome** runs up to 3.
 
 ## Dependencies
 
+- **Engines** — [invisible_playwright](https://github.com/feder-cr/invisible_playwright) (stealth Firefox, default) · [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) (stealth Chrome)
 - [Playwright](https://playwright.dev/) — browser automation
 - [Starlette](https://www.starlette.io/) + [Uvicorn](https://www.uvicorn.org/) — HTTP/SSE server
 - [MCP SDK](https://github.com/modelcontextprotocol/python-sdk) — Model Context Protocol

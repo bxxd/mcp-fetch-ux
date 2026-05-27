@@ -2,13 +2,15 @@
 
 ## Design Principles
 
-**ONE TRUE PATH**: One way to do each thing. CLI calls the handler. Handler calls the client. No alternate code paths, no fallbacks. If it's wrong, you'll know fast.
+**ONE TRUE PATH**: One way to do each thing. CLI calls the handler. Handler calls the client. No alternate code paths, no fallbacks. The browser engine is selected *once at startup* via `FETCH_UX_ENGINE` — that's mode selection, not a runtime fallback, so the principle holds within a process.
 
-**KISS**: Simplest solution that works. The clipboard approach is one line (`navigator.clipboard.readText()`) that replaces hundreds of lines of DOM traversal, Shadow DOM piercing, and Readability extraction for most pages.
+**KISS**: Simplest solution that works. The clipboard approach — select-all + copy, then read the clipboard back — replaces hundreds of lines of DOM traversal, Shadow DOM piercing, and Readability extraction.
 
 **SEPARATION OF CONCERNS**: Library fetches. Handler formats. Server routes. Tools describe. Each file does one thing.
 
-**HEXAGONAL**: `fetch_ux/` is the core — no MCP deps, no server deps. `mcp_fetch_ux/` is the adapter. Swap the transport without touching the fetcher.
+**HEXAGONAL — two ports**:
+- *Transport*: `mcp_fetch_ux/` wraps the `fetch_ux/` core — swap transport without touching the fetcher.
+- *Browser*: `fetch_ux/engines/` (`BrowserEngine`) — swap Firefox ↔ Chrome via `FETCH_UX_ENGINE` without touching the extraction core. The core (`client.py`) holds zero browser-specific code; adapters own the lifecycle + clipboard read-back.
 
 **PRIMARY SOURCES**: The browser renders the page. The clipboard captures what it renders. No intermediate summarization, no LLM interpretation. Raw content to the model.
 
@@ -21,8 +23,12 @@ mcp-fetch-ux/
 ├── src/
 │   ├── fetch_ux/              Pure library (no MCP deps)
 │   │   ├── __init__.py
-│   │   └── client.py          FetchClient — Patchright + clipboard extraction
-│   │                           (real Chrome via Patchright, one persistent context)
+│   │   ├── client.py          FetchClient — engine-agnostic fetch + extraction core
+│   │   └── engines/           Browser-engine port + adapters
+│   │       ├── __init__.py    BrowserEngine protocol + make_engine factory
+│   │       ├── base.py        BaseEngine — shared interactions (overlay dismiss, select+copy)
+│   │       ├── invisible.py   InvisibleEngine — stealth Firefox (default)
+│   │       └── chrome.py      ChromeEngine — real Chrome via Patchright
 │   └── mcp_fetch_ux/          MCP server
 │       ├── __init__.py
 │       ├── __main__.py         Entry point
@@ -53,9 +59,12 @@ Dismiss cookie/consent overlays
 Human-like pause (200-600ms random)
     │
     ▼
-Poll: Ctrl+A → Ctrl+C → clipboard.readText()
+Poll: engine.capture_text()  [select-all + copy, then engine-specific read-back]
     │  400-600ms jittered intervals, stable after 2 consecutive equal readings
     │  Max 12 iterations (~6s)
+    │
+    ▼
+Re-dismiss overlays (catch late SPA consent banners) → re-capture if one was removed
     │
     ▼
 Run actions (if any) — click, fill, wait, select, scroll
@@ -72,11 +81,15 @@ Return text + available actions + pagination
 
 ### Why clipboard
 
-`page.innerText('body')` and `window.getSelection().toString()` don't cross Shadow DOM boundaries. The clipboard API does — it captures what a human gets with Ctrl+A, Ctrl+C. Tested on:
+`page.innerText('body')` and `window.getSelection().toString()` don't cross Shadow DOM boundaries (closed roots especially). The clipboard does — Ctrl+A/Ctrl+C copies the *rendered* selection, including (closed) Shadow DOM. Tested on:
 
-- Roche pipeline (web components + Shadow DOM) — gets all 131 drugs
+- Roche pipeline (web components + Shadow DOM) — gets the full pipeline
 - Wikipedia (static HTML) — gets full article
 - GitHub (React SPA) — gets full README
+
+**Reading the clipboard back is engine-specific** — that's the crux of why this is a port (`engine.capture_text()`):
+- **chrome**: `navigator.clipboard.readText()` — Chromium honors the context's `clipboard-read` permission grant.
+- **invisible (Firefox)**: reads the X11 clipboard out-of-process with `xclip`. Reading it back *inside the page* (the obvious route — `readText()`, or pasting into a `<textarea>` and reading `.value`) goes through `page.evaluate`, which runs in Firefox's main world and is **blocked by strict site CSP** (`script-src` without `unsafe-eval` — Hacker News always, Roche intermittently): it throws `call to eval() blocked by CSP` or hangs the whole fetch to timeout. A subprocess reading the OS clipboard never touches the page, so CSP can't reach it. The copy+read is serialized (`_clip_lock`) — one global clipboard per display.
 
 ### Why poll for stability
 
@@ -84,11 +97,13 @@ JS frameworks render asynchronously. The DOM loads fast but data arrives via API
 
 ### Browser lifecycle
 
-One real Chrome (via Patchright `launch_persistent_context(channel="chrome")`) for the lifetime of the server process. One persistent context → a warm, **shared** cookie jar. Each fetch opens and closes a *page*, not a context; the context stays warm. `FETCH_UX_COOKIE_TTL` (default 1 day) throws the jar away on a timer via the recycle path, so a flagged session can't poison it forever.
+The engine (selected by `FETCH_UX_ENGINE`) launches one warm browser for the process lifetime via `engine.start()`. Each fetch gets a page from `engine.new_page()` and closes it (`_closer()`); the browser stays warm. `FETCH_UX_RECYCLE_TTL` (default 1 day) recycles the whole browser on a timer — `_recycle_browser()` stops then restarts the engine — so a flagged session/fingerprint can't poison us forever. The same path runs if a page close hangs (stuck renderer).
 
-Trade-off of one shared context: cookies are shared across fetches (fine for public-page fetching; the daily TTL bounds it). The alternative — a fresh context per fetch — would give isolation but forfeits the warm jar and is not Patchright's recommended stealth config.
+Both engines keep state warm across fetches:
+- **invisible**: one Firefox with one shared context, created once at `start()`; each fetch opens a *tab* (`context.new_page`). Fresh coherent fingerprint per `start()`/recycle. Opening a target in this Firefox intermittently deadlocks (~7.5% under heavy churn) — a healthy creation returns in <0.7s, a bad one hangs forever — so `new_page()` bounds each attempt at 6s and retries; the retry returns in ~0.5s.
+- **chrome**: one persistent context = a warm, **shared** cookie jar (cookies shared across fetches — fine for public pages; the recycle TTL bounds it).
 
-`asyncio.Semaphore(3)` limits concurrent fetches to prevent memory spikes. The per-fetch page release is built by `_closer()`.
+Concurrent fetches are gated by an `asyncio.Semaphore` sized from `engine.concurrency`: **invisible = 1** (a single Firefox can't safely create targets in parallel, and the read-back rides one global clipboard), **chrome = 3** (Chromium isolates per context).
 
 ### Actions
 
@@ -120,12 +135,9 @@ The agent sees what's available and can call again with actions. Two-step flow: 
 
 ### Cookie/consent dismissal
 
-Runs automatically before content capture AND before actions. Tries common selectors:
-- `#onetrust-reject-all-handler`, `#onetrust-accept-btn-handler`
-- `button:has-text('Accept All')`, `Reject All`, `Accept`, `OK`, `I Agree`
-- `[id*='cookie'] button`, `[class*='consent'] button`
+Lives on the engine (`BaseEngine.dismiss_overlays`, shared by both adapters). Tries common selectors (OneTrust handlers; `Accept All`/`Reject All`/`Accept`/`OK`/`I Agree`; `[id*='cookie'] button`, `[id*='consent'] button`), 300ms visibility timeout each, clicks the first visible, returns `True` if it dismissed one.
 
-300ms visibility timeout per selector. Clicks first match.
+Called twice by the core: right after `goto`, and again **after content renders** — that second call catches late, JS-injected banners (e.g. Quest) that don't exist yet at `goto`; if it removes one, the core re-captures so the banner text isn't in the output. (A third time before actions, if any.)
 
 ## MCP Transport
 
@@ -228,7 +240,7 @@ PDF downloads are automatically converted to text via `pdftotext`. Other binary 
 
 - **Bot detection**: real Chrome + Patchright present a coherent fingerprint (no manual masking). Beats Cloudflare/Datadome-class walls; not Google's reCAPTCHA-Enterprise SERP. Datacenter IPs still get blocked regardless — use a residential egress.
 
-- **Memory**: one persistent context for the process; each fetch opens/closes a page. `FETCH_UX_COOKIE_TTL` recycles the whole context (fresh profile) on a timer. Semaphore caps at 3 concurrent. Monitor under heavy load.
+- **Memory**: one warm browser/context for the process; each fetch opens/closes a page. `FETCH_UX_RECYCLE_TTL` (default 1 day) recycles the whole browser on a timer. The fetch semaphore is sized from `engine.concurrency` (invisible 1, chrome 3). Monitor under heavy load.
 
 - **Timeouts**: 30s default on all Patchright operations. Actions get 5s each. No operation hangs indefinitely.
 

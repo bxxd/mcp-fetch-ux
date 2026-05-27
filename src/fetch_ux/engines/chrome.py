@@ -38,6 +38,11 @@ def _chrome_args() -> list[str]:
 class ChromeEngine(BaseEngine):
     name = "chrome"
 
+    # Chromium isolates each fetch in its own browser context and reads the clipboard
+    # via a per-context permission grant (no global-clipboard or shared-target-creation
+    # hazard), so it runs several fetches at once safely.
+    concurrency = 3
+
     def __init__(self, timeout_ms: int = 60_000, headless: bool | None = None):
         self.timeout_ms = timeout_ms
         self._headless = (

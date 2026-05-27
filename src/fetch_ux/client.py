@@ -108,7 +108,11 @@ class FetchClient:
         self._recycle_ttl = max(0, ttl)  # negative is meaningless; 0 = never recycle
         self._started = False
         self._born: float = 0.0
-        self._semaphore = asyncio.Semaphore(3)
+        # Size the fetch gate from what the engine declares it can safely run at once
+        # (invisible=1: single Firefox deadlocks on concurrent target creation;
+        # chrome=3: Chromium isolates per context). Falls back to 1 for any engine
+        # that doesn't declare it.
+        self._semaphore = asyncio.Semaphore(getattr(self._engine, "concurrency", 1))
         self._needs_restart = False
         self._recycle_lock = asyncio.Lock()
 
