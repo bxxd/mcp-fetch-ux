@@ -114,7 +114,8 @@ def test_engines_satisfy_port():
     """Both adapters expose the BrowserEngine interface."""
     for name in ("invisible", "chrome"):
         e = make_engine(name=name)
-        for m in ("start", "new_page", "capture_text", "dismiss_overlays", "stop"):
+        for m in ("start", "new_page", "acquire_page", "release_page",
+                  "capture_text", "dismiss_overlays", "stop"):
             assert callable(getattr(e, m)), f"{name} missing {m}"
 
 

@@ -205,22 +205,43 @@ class FetchClient:
             except asyncio.TimeoutError:
                 raise TimeoutError(f"Timed out after {self.timeout_ms // 1000}s fetching {url}")
 
-    def _closer(self, page):
-        """Build the per-fetch release coroutine; on a close hang, flag a recycle."""
-        async def _release(url: str = ""):
+    async def _goto(self, page, url: str):
+        """Navigate, retrying once on a transient 'interrupted by another navigation'.
+        A freshly opened tab can fire an internal about:blank/about:newtab navigation
+        that interrupts the first goto; the retry lands after it settles."""
+        for attempt in range(2):
             try:
-                await asyncio.wait_for(page.close(), timeout=5.0)
-            except Exception:
-                if not self._recycle_lock.locked():
-                    self._needs_restart = True
-                logger.warning("page.close() timed out for %s — scheduling recycle", url)
-        return _release
+                return await page.goto(
+                    url, wait_until="domcontentloaded", timeout=self.timeout_ms
+                )
+            except Exception as e:
+                if attempt == 0 and "interrupted by another navigation" in str(e):
+                    continue
+                raise
 
-    async def _acquire_page(self):
-        """Get a page from the engine; the engine keeps the browser warm, we just
-        open and close the page per fetch."""
-        page = await self._engine.new_page()
-        return page, self._closer(page)
+    @staticmethod
+    async def _collect_disk_download(dl_dir, before, settle=2.0, timeout=20.0):
+        """For engines that save downloads to disk instead of firing Playwright's
+        download event (invisible Firefox): poll `dl_dir` for a new *completed* file
+        (Firefox writes a `.part` while in flight, renames when done). Returns
+        (path, filename) or None. Waits up to `settle` for a download to even start,
+        then up to `timeout` for it to finish."""
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while loop.time() - start < timeout:
+            try:
+                new = set(os.listdir(dl_dir)) - before
+            except OSError:
+                return None
+            done = [f for f in new if not f.endswith((".part", ".tmp", ".crdownload"))]
+            if done:
+                newest = max(done, key=lambda n: os.path.getmtime(os.path.join(dl_dir, n)))
+                return os.path.join(dl_dir, newest), newest
+            # Nothing started within the settle window → this fetch has no download.
+            if not new and (loop.time() - start) > settle:
+                return None
+            await asyncio.sleep(0.25)
+        return None
 
     async def _fetch_impl(
         self,
@@ -233,18 +254,32 @@ class FetchClient:
         download_file: Download | None = None
         download_content: str | None = None
 
-        page, _release_page = await self._acquire_page()
+        page = await self._engine.acquire_page()
+        ok = False
+        popups: list = []
+        # Engines that can't use Playwright's download event (invisible Firefox) save
+        # files to disk instead. Snapshot the dir now so we can spot *this* fetch's new
+        # file after the actions run.
+        dl_dir = getattr(self._engine, "download_dir", None)
+        dl_before = set(os.listdir(dl_dir)) if dl_dir and os.path.isdir(dl_dir) else set()
+
+        def _on_download(d: Download):
+            nonlocal download_file
+            download_file = d
+
+        def _on_popup(p):
+            # Some sites export a file by opening a new tab that then downloads (CSV/PDF
+            # "open in new window"). Catch downloads there too, and track the popup so we
+            # can close it — like a real user's browser, which handles the popup download.
+            popups.append(p)
+            p.on("download", _on_download)
+
+        # Named handlers (not lambdas) so we can remove them before releasing — the tab
+        # is reused by later fetches, and stale listeners would pile up.
+        page.on("download", _on_download)
+        page.on("popup", _on_popup)
         try:
-            # Listen for downloads
-            page.on("download", lambda d: _capture_download(d))
-
-            def _capture_download(d: Download):
-                nonlocal download_file
-                download_file = d
-
-            response = await page.goto(
-                url, wait_until="domcontentloaded", timeout=self.timeout_ms
-            )
+            response = await self._goto(page, url)
             status = response.status if response else 0
 
             try:
@@ -289,11 +324,15 @@ class FetchClient:
 
             # Run actions
             if actions:
-                # Dismiss any overlays that appeared after content load
-                try:
-                    await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=5.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
+                # Dismiss overlays again right before actions — some sites (Roche)
+                # re-show or delay their OneTrust modal until after initial load.
+                for _ in range(2):
+                    try:
+                        await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=4.0)
+                    except (asyncio.TimeoutError, Exception):
+                        pass
+                    await page.wait_for_timeout(300)
+
                 for act in actions:
                     await self._run_action(page, act)
                     # Check if a download was triggered
@@ -302,16 +341,34 @@ class FetchClient:
                     # Human-like pause between actions
                     await page.wait_for_timeout(random.randint(100, 400))
 
-            # If a download was triggered, read its content
+            # If a download was triggered, read its content.
             download_filename = None
             if download_file:
+                # Playwright download event (Chromium).
                 path = await download_file.path()
                 download_filename = download_file.suggested_filename
                 if path:
                     download_url = download_file.url or url
                     download_content = _read_download(path, download_filename, download_url)
+            elif dl_dir and actions:
+                # Disk-based capture (invisible Firefox): the file was saved to the
+                # download dir. Grab the new file, read it, then delete it so the dir
+                # doesn't accumulate and the next fetch's snapshot stays clean.
+                got = await self._collect_disk_download(dl_dir, dl_before)
+                if got:
+                    path, download_filename = got
+                    download_content = _read_download(path, download_filename, url)
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
-            title = await page.title()
+            # Best-effort: a late client-side navigation (some SPAs) can destroy the
+            # execution context right here; the title isn't worth failing the fetch.
+            try:
+                title = await page.title()
+            except Exception:
+                title = ""
 
             if download_content is not None:
                 content = download_content
@@ -325,8 +382,24 @@ class FetchClient:
 
             # Discover available actions on the page
             actions_available = await self._discover_actions(page)
+            ok = True
         finally:
-            await _release_page(url)
+            try:
+                page.remove_listener("download", _on_download)
+                page.remove_listener("popup", _on_popup)
+            except Exception:
+                pass
+            # Close any popups this fetch opened (a popup download was already read
+            # above) so they don't accumulate in the reused context.
+            for p in popups:
+                try:
+                    await p.close()
+                except Exception:
+                    pass
+            # Healthy tab → back to the pool for reuse; a failed fetch's tab is
+            # discarded so the next fetch starts clean (engine decides — see
+            # BaseEngine/InvisibleEngine.release_page).
+            await self._engine.release_page(page, ok=ok)
 
         original_length = len(content)
         truncated = False
@@ -363,77 +436,124 @@ class FetchClient:
         )
 
     async def _discover_actions(self, page) -> list[str]:
-        """Find interactive elements on the page the agent can use."""
+        """Find interactive elements the agent can act on.
+
+        This version uses Playwright locators from the Python side (driver protocol).
+        It is CSP-safe: it does not require page.evaluate("..."), so it works on
+        strict sites like news.ycombinator.com that block 'unsafe-eval'.
+
+        We prioritize completeness ("get all the actions") over micro-optimizing
+        latency. Caps are set reasonably high; the final result is still truncated
+        to 50 actions.
+        """
+        actions: list[str] = []
+        seen: set[str] = set()
+
+        def add(desc: str) -> None:
+            if desc not in seen and len(desc) < 200:
+                seen.add(desc)
+                actions.append(desc)
+
         try:
-            return await page.evaluate("""() => {
-                const actions = [];
-                const seen = new Set();
+            # Buttons
+            button_locator = page.locator("button:visible")
+            button_texts = await button_locator.all_text_contents()
+            for text in button_texts[:60]:
+                t = (text or "").strip()
+                if 2 <= len(t) <= 80:
+                    safe = t.replace("'", "\\'")
+                    add(f'click: "button:has-text(\'{safe}\')"')
 
-                // Helper to add unique action
-                function add(action) {
-                    if (!seen.has(action) && action.length < 200) {
-                        seen.add(action);
-                        actions.push(action);
-                    }
-                }
+            # Links (the most important source on most real pages)
+            link_locator = page.locator("a[href]:visible")
+            link_texts = await link_locator.all_text_contents()
+            # We still need per-element hrefs. Do them in one batched evaluate_all
+            # (this is still safer / more contained than the old full evaluate blob).
+            try:
+                hrefs = await link_locator.evaluate_all("els => els.map(el => el.getAttribute('href') || '')")
+            except Exception:
+                # Fallback if evaluate_all is blocked on a very strict page
+                hrefs = [""] * len(link_texts)
 
-                // Buttons with visible text
-                document.querySelectorAll('button').forEach(el => {
-                    const text = el.textContent?.trim();
-                    if (text && text.length > 1 && text.length < 80 && el.offsetParent !== null) {
-                        add('click: "button:has-text(\\'' + text.replace(/'/g, "\\\\'") + '\\')"');
-                    }
-                });
+            for text, href in zip(link_texts, hrefs):
+                t = (text or "").strip()
+                h = (href or "").strip()
+                if 2 <= len(t) <= 80 and h and not h.startswith(("#", "javascript:")):
+                    safe = t.replace("'", "\\'")
+                    add(f'click: "a:has-text(\'{safe}\')" → {h[:80]}')
 
-                // Links with text (not nav/footer)
-                document.querySelectorAll('a[href]').forEach(el => {
-                    const text = el.textContent?.trim();
-                    if (text && text.length > 1 && text.length < 80 && el.offsetParent !== null) {
-                        const href = el.getAttribute('href');
-                        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-                            add('click: "a:has-text(\\'' + text.replace(/'/g, "\\\\'") + '\\')" → ' + href.substring(0, 80));
-                        }
-                    }
-                });
+            # Download-oriented links (explicit or by extension)
+            download_locator = page.locator(
+                "a[download]:visible, a[href$='.csv']:visible, a[href$='.pdf']:visible, a[href$='.xlsx']:visible"
+            )
+            dl_texts = await download_locator.all_text_contents()
+            try:
+                dl_hrefs = await download_locator.evaluate_all(
+                    "els => els.map(el => el.getAttribute('href') || el.getAttribute('download') || '')"
+                )
+            except Exception:
+                dl_hrefs = [""] * len(dl_texts)
 
-                // Elements with onclick window.location (clickable divs etc.)
-                document.querySelectorAll('[onclick]').forEach(el => {
-                    const onclick = el.getAttribute('onclick') || '';
-                    const m = onclick.match(/window\.location\s*=\s*['"]([^'"]+)['"]/);
-                    if (m && el.offsetParent !== null) {
-                        const href = m[1];
-                        const text = el.querySelector('.post-title, h1, h2, h3')?.textContent?.trim()
-                            || el.textContent?.trim().substring(0, 60);
-                        if (text) {
-                            add('click: "[onclick]" → ' + href + ' (' + text.replace(/\s+/g, ' ') + ')');
-                        }
-                    }
-                });
+            for text, href in zip(dl_texts, dl_hrefs):
+                name = (text or "").strip() or (href or "").strip()
+                if name:
+                    add(f'download: "{name[:80]}"')
 
-                // Download links
-                document.querySelectorAll('a[download], a[href$=".csv"], a[href$=".pdf"], a[href$=".xlsx"]').forEach(el => {
-                    const text = el.textContent?.trim() || el.getAttribute('download') || el.href;
-                    add('download: "' + text + '"');
-                });
+            # Form controls - inputs
+            input_locator = page.locator("input:not([type=hidden]):visible")
+            input_elements = await input_locator.all()
+            for el in input_elements[:30]:
+                try:
+                    name = (
+                        await el.get_attribute("name")
+                        or await el.get_attribute("id")
+                        or await el.get_attribute("aria-label")
+                        or await el.get_attribute("type")
+                        or "input"
+                    )
+                    if name:
+                        typ = await el.get_attribute("type") or "text"
+                        add(f'fill: "{name}" ({typ})')
+                except Exception:
+                    continue
 
-                // Input fields
-                document.querySelectorAll('input:not([type=hidden]), textarea, select').forEach(el => {
-                    const name = el.name || el.id || el.getAttribute('aria-label') || el.type;
-                    if (name && el.offsetParent !== null) {
-                        const tag = el.tagName.toLowerCase();
-                        if (tag === 'select') {
-                            const opts = Array.from(el.options).slice(0, 5).map(o => o.text).join(', ');
-                            add('select: "' + name + '" options=[' + opts + ']');
-                        } else {
-                            add('fill: "' + name + '" (' + (el.type || tag) + ')');
-                        }
-                    }
-                });
+            # Textareas
+            textarea_locator = page.locator("textarea:visible")
+            textarea_elements = await textarea_locator.all()
+            for el in textarea_elements[:15]:
+                try:
+                    name = (
+                        await el.get_attribute("name")
+                        or await el.get_attribute("id")
+                        or await el.get_attribute("aria-label")
+                        or "textarea"
+                    )
+                    if name:
+                        add(f'fill: "{name}" (textarea)')
+                except Exception:
+                    continue
 
-                return actions.slice(0, 50);  // Cap at 50
-            }""")
+            # Selects
+            select_locator = page.locator("select:visible")
+            select_elements = await select_locator.all()
+            for el in select_elements[:15]:
+                try:
+                    name = (
+                        await el.get_attribute("name")
+                        or await el.get_attribute("id")
+                        or await el.get_attribute("aria-label")
+                        or "select"
+                    )
+                    if name:
+                        add(f'select: "{name}"')
+                except Exception:
+                    continue
+
         except Exception:
-            return []
+            # Page is hostile or closed; best effort only
+            pass
+
+        return actions[:50]
 
     async def _run_action(self, page, act: dict):
         """Execute a single page action."""
@@ -459,14 +579,19 @@ class FetchClient:
                         await page.wait_for_timeout(random.randint(50, 200))
                 except Exception:
                     pass  # Best-effort — proceed to click even if move fails
-                # Check if click triggers a download
-                try:
-                    async with page.expect_download(timeout=timeout):
-                        await loc.click(timeout=timeout)
-                    # Download was triggered — it's captured by the event listener
-                    return
-                except Exception:
-                    # No download — normal click
+                # Event-based engines (Chromium): wrap the click in expect_download so
+                # a click that triggers a download is caught. Disk-based engines
+                # (invisible Firefox) never fire that event — they capture downloads
+                # from the download dir after actions — so they click plainly; wrapping
+                # would just burn the full timeout on every non-download click.
+                if getattr(self._engine, "download_dir", None) is None:
+                    try:
+                        async with page.expect_download(timeout=timeout):
+                            await loc.click(timeout=timeout)
+                        return  # download triggered — captured by the event listener
+                    except Exception:
+                        await loc.click(timeout=timeout)  # no download — normal click
+                else:
                     await loc.click(timeout=timeout)
             except Exception as e:
                 logger.warning(f"Action click({selector}) failed: {e}")
@@ -502,8 +627,13 @@ class FetchClient:
 
         elif action == "scroll":
             direction = act.get("direction", "bottom")
-            if direction == "bottom":
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            elif direction == "top":
-                await page.evaluate("window.scrollTo(0, 0)")
+            # Use keyboard input protocol (CSP-safe, no page.evaluate).
+            # "End"/"Home" reliably jump to the actual scroll boundaries even on very tall pages.
+            try:
+                if direction == "bottom":
+                    await page.keyboard.press("End")
+                elif direction == "top":
+                    await page.keyboard.press("Home")
+            except Exception as e:
+                logger.warning(f"Action scroll({direction}) failed: {e}")
             await page.wait_for_timeout(500)

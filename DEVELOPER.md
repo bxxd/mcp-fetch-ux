@@ -133,6 +133,8 @@ Available actions on this page:
 
 The agent sees what's available and can call again with actions. Two-step flow: discover, then act.
 
+Discovery is implemented with Playwright locators from the Python/driver side (not `page.evaluate`). This is deliberately CSP-safe and works on strict sites such as news.ycombinator.com that block `'unsafe-eval'`. The older JS-in-page version was replaced for this reason.
+
 ### Cookie/consent dismissal
 
 Lives on the engine (`BaseEngine.dismiss_overlays`, shared by both adapters). Tries common selectors (OneTrust handlers; `Accept All`/`Reject All`/`Accept`/`OK`/`I Agree`; `[id*='cookie'] button`, `[id*='consent'] button`), 300ms visibility timeout each, clicks the first visible, returns `True` if it dismissed one.

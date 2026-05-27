@@ -32,7 +32,18 @@ class BrowserEngine(Protocol):
         ...
 
     async def new_page(self):
-        """Return a ready Playwright Page to fetch on. The core closes it."""
+        """Create a fresh Playwright Page. Low-level primitive used by acquire_page;
+        the core calls acquire_page/release_page, not this directly."""
+        ...
+
+    async def acquire_page(self):
+        """Return a ready Page for one fetch — a fresh page, or a reused one from a
+        pool; the adapter decides. Pair every call with release_page."""
+        ...
+
+    async def release_page(self, page, *, ok: bool = True) -> None:
+        """Release a page after a fetch. `ok` reports whether the fetch succeeded, so
+        a pooling adapter can reuse a healthy page and discard a wedged one."""
         ...
 
     async def dismiss_overlays(self, page) -> bool:
@@ -44,8 +55,8 @@ class BrowserEngine(Protocol):
         """Select-all + copy the rendered page (incl. Shadow DOM) and return the
         text. The select/copy is shared (BaseEngine.select_all_and_copy); the
         read-back is engine-specific — Chromium uses clipboard.readText()
-        (permission-granted), Firefox pastes into a textarea (its readText is
-        gated by user activation)."""
+        (permission-granted), Firefox reads the X clipboard via xclip (its readText
+        is gated by user activation and in-page reads hit page CSP)."""
         ...
 
     async def stop(self) -> None:

@@ -8,6 +8,9 @@ ceiling. Needs a display — run headed under xvfb on a server.
 
 import asyncio
 import logging
+import os
+import shutil
+import tempfile
 
 from invisible_playwright.async_api import InvisiblePlaywright
 
@@ -16,31 +19,82 @@ from fetch_ux.engines.base import BaseEngine
 logger = logging.getLogger("fetch_ux")
 
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+# Hang-guard for one-shot browser-context creation (seconds). Normal creation is a
+# few seconds; this only bounds a pathological stall so startup fails loudly instead
+# of blocking. Override with FETCH_UX_CONTEXT_TIMEOUT.
+CONTEXT_CREATE_TIMEOUT = _float_env("FETCH_UX_CONTEXT_TIMEOUT", 20.0)
+
+# MIME types we auto-save to the download dir without a "what to do?" prompt. This
+# Firefox build's Juggler doesn't fire Playwright's download event, so downloads must
+# land on disk and be read from there (see download_dir + the core's disk capture).
+_DOWNLOAD_SAVE_MIMES = ",".join([
+    "text/csv", "application/csv", "application/x-csv", "text/comma-separated-values",
+    "application/octet-stream", "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/pdf", "application/zip", "application/json", "text/plain",
+])
+
+
 class InvisibleEngine(BaseEngine):
     name = "invisible"
 
-    # One fetch at a time. Opening a browser target in this Firefox intermittently
-    # deadlocks (see new_page), and the clipboard read-back rides one global X
-    # selection per display — running fetches in parallel multiplies both hazards.
-    # Serial execution plus the new_page retry is the combination observed reliable
-    # here; true parallelism would need a pool of separate Firefox processes (later).
-    concurrency = 1
+    # Up to N concurrent fetches, served by an on-demand pool of reused tabs (see
+    # acquire_page). The hazard in this Firefox is opening a target *concurrently*
+    # (see new_page) — so the pool serializes tab *creation* but lets fetches *operate*
+    # on their own tabs in parallel, which the probes showed is safe. Tabs are reused,
+    # so creation (and its deadlock risk) only happens during warmup / after an error,
+    # not on the hot path.
+    concurrency = 3
 
     def __init__(self, timeout_ms: int = 60_000):
         self.timeout_ms = timeout_ms
         self._inv = None       # InvisiblePlaywright async context manager
         self._browser = None   # Playwright Firefox Browser, kept warm
         self._context = None   # ONE shared context, created once; fetches open tabs
+        self._pool: list = []  # idle reusable tabs (pages); acquire pops, release returns
+        # Serializes tab CREATION only — two concurrent new_page() calls are what
+        # deadlock. Operating existing tabs in parallel is fine, so release never takes
+        # this lock (a finished fetch returns its tab without waiting on a creation).
+        self._create_lock = asyncio.Lock()
         # The X11 clipboard is ONE global resource per display. Ctrl+C → xclip-read
         # must not interleave across concurrent pages, or one fetch reads another's
         # copied text. Serialize just that critical section (not the whole fetch).
         self._clip_lock = asyncio.Lock()
+        # Downloads land here on disk (this Firefox can't fire Playwright's download
+        # event). The core reads new files from this dir and deletes them after. One
+        # dir per engine; Firefox's download.dir is browser-global so the pool shares it.
+        self.download_dir = tempfile.mkdtemp(prefix="fetchux-ff-dl-")
+
+    def _download_prefs(self) -> dict:
+        """Firefox prefs that save downloads straight to our dir with no prompt — the
+        only way this build downloads, since its Juggler never fires Playwright's
+        download event. pdfjs.disabled so PDFs download instead of opening inline."""
+        return {
+            "browser.download.folderList": 2,          # 2 = custom dir
+            "browser.download.dir": self.download_dir,
+            "browser.download.useDownloadDir": True,
+            "browser.download.manager.showWhenStarting": False,
+            "browser.download.always_ask_before_handling_new_types": False,
+            "browser.helperApps.neverAsk.saveToDisk": _DOWNLOAD_SAVE_MIMES,
+            "pdfjs.disabled": True,
+        }
 
     async def start(self) -> None:
+        # Start with a clean download dir each launch/recycle (stale files would
+        # confuse the core's new-file detection).
+        shutil.rmtree(self.download_dir, ignore_errors=True)
+        os.makedirs(self.download_dir, exist_ok=True)
         # humanize=False: the Bezier-mouse hooks interfere with async goto (it
         # returns no status). We don't need them — plain fetches use the keyboard,
         # and _run_action already simulates mouse movement for clicks.
-        self._inv = InvisiblePlaywright(humanize=False)
+        self._inv = InvisiblePlaywright(humanize=False, extra_prefs=self._download_prefs())
         self._browser = await self._inv.__aenter__()
         # Create the browser context ONCE here. browser.new_page() (used previously)
         # spins up a fresh context every fetch, and *context* creation is the hang-prone
@@ -48,30 +102,71 @@ class InvisibleEngine(BaseEngine):
         # viewport overrides could hang launch). Doing it once and opening only tabs
         # (context.new_page) per fetch eliminated the deadlock. Stealth is binary/
         # profile-level so every tab carries the full fingerprint.
-        self._context = await asyncio.wait_for(self._browser.new_context(), timeout=60.0)
+        # accept_downloads=True so the browser keeps downloads instead of cancelling
+        # them (Playwright's default is to cancel) — a real user's clicks that produce
+        # files (CSV/PDF export) must work here too. Chrome's engine already sets this.
+        self._context = await asyncio.wait_for(
+            self._browser.new_context(accept_downloads=True),
+            timeout=CONTEXT_CREATE_TIMEOUT,
+        )
+        self._pool = []  # fresh browser → no carried-over tabs
         logger.info("engine=invisible: stealth Firefox up")
 
+    async def acquire_page(self):
+        """Hand out a ready tab: reuse an idle one from the pool, else create one.
+
+        Creation is serialized (`_create_lock`) because *concurrent* tab creation is
+        what deadlocks this Firefox; reuse (the common case under load) takes no lock.
+        """
+        if self._pool:                       # sync pop — no await, so no race
+            return self._pool.pop()
+        async with self._create_lock:
+            if self._pool:                   # someone released while we waited for the lock
+                return self._pool.pop()
+            return await self.new_page()     # has its own stall-and-retry guard
+
+    async def release_page(self, page, *, ok: bool = True) -> None:
+        """Return a healthy tab to the pool for reuse; discard a bad one so the next
+        acquire makes a fresh tab (fault isolation — a wedged page isn't reused)."""
+        if ok:
+            self._pool.append(page)          # sync — release never blocks on a creation
+            return
+        try:
+            await asyncio.wait_for(page.close(), timeout=5.0)
+        except Exception:
+            pass
+
     async def new_page(self):
-        # Opening a target in this Firefox intermittently deadlocks (~7.5% under heavy
-        # churn): a healthy creation returns in <0.7s, a bad one hangs forever — but
-        # the evidence is clear that *abandoning a hung attempt and retrying succeeds
-        # immediately* (the next new_page returns in ~0.5s). So bound each attempt
-        # well above the normal time and retry. (A tab in the shared context, not a
-        # new context — with concurrency=1 only one tab is ever live at a time.)
+        """Create a settled, *validated* tab. Opening a target in this Firefox is flaky
+        whenever it overlaps other activity: it can stall (deadlock), come up with its
+        browsingContext not ready ("can't access property loadURI"), or race FF150's
+        internal about:newtab nav. A fixed delay can't cover all three, so: create, let
+        the internal nav land, then prove the tab is navigable with a throwaway
+        about:blank; on *any* failure, discard the tab and retry fresh. Reused tabs (the
+        hot path) never run this — it's warmup / post-error only."""
         last_exc: Exception | None = None
         for attempt in range(3):
+            page = None
             try:
                 page = await asyncio.wait_for(self._context.new_page(), timeout=6.0)
-                try:
-                    page.set_default_timeout(self.timeout_ms)
-                except Exception:
-                    pass
+                page.set_default_timeout(self.timeout_ms)
+                await asyncio.sleep(0.4)  # let FF's internal about:newtab nav land
+                # Prove the tab is actually navigable before handing it to a fetch.
+                await asyncio.wait_for(
+                    page.goto("about:blank", wait_until="domcontentloaded"), timeout=8.0
+                )
                 return page
-            except asyncio.TimeoutError as exc:
+            except Exception as exc:
                 last_exc = exc
-                logger.warning("new_page() stalled (attempt %d/3) — retrying", attempt + 1)
+                logger.warning("new_page() attempt %d/3 failed: %s — retrying",
+                               attempt + 1, type(exc).__name__)
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
                 await asyncio.sleep(0.25)
-        raise last_exc  # all attempts stalled — surface as a normal fetch error
+        raise last_exc  # all attempts failed — surface as a normal fetch error
 
     async def capture_text(self, page) -> str:
         """Read rendered text (incl. closed Shadow DOM) back via the OS clipboard.
@@ -84,6 +179,10 @@ class InvisibleEngine(BaseEngine):
         A subprocess reading the clipboard never touches the page, so CSP can't
         reach it. The copy+read is serialized (`_clip_lock`) because the clipboard
         is global per display.
+
+        The same CSP rule previously broke action discovery and the scroll action
+        (both used raw page.evaluate strings). Those were moved to locator-based
+        + mouse wheel calls so the invisible engine now works on HN and similar sites.
         """
         async with self._clip_lock:
             await self.select_all_and_copy(page)
@@ -114,6 +213,7 @@ class InvisibleEngine(BaseEngine):
         self._inv = None
         self._browser = None
         self._context = None
+        self._pool = []
         if inv:
             try:
                 await asyncio.wait_for(inv.__aexit__(None, None, None), timeout=10.0)
