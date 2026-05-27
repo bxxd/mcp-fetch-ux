@@ -36,21 +36,11 @@ class InvisibleEngine(BaseEngine):
         # copied text. Serialize just that critical section (not the whole fetch).
         self._clip_lock = asyncio.Lock()
 
-    # Vestigial — these enabled navigator.clipboard.readText() for the old in-page
-    # read-back. capture_text now reads the clipboard out-of-process via xclip and
-    # never calls readText; left in place (harmless) rather than risk a known-good
-    # launch config for no gain.
-    _PREFS = {
-        "dom.events.asyncClipboard.readText": True,
-        "dom.events.testing.asyncClipboard": True,
-        "dom.events.asyncClipboard.clipboardItem": True,
-    }
-
     async def start(self) -> None:
         # humanize=False: the Bezier-mouse hooks interfere with async goto (it
         # returns no status). We don't need them — plain fetches use the keyboard,
         # and _run_action already simulates mouse movement for clicks.
-        self._inv = InvisiblePlaywright(humanize=False, extra_prefs=self._PREFS)
+        self._inv = InvisiblePlaywright(humanize=False)
         self._browser = await self._inv.__aenter__()
         # Create the browser context ONCE here. browser.new_page() (used previously)
         # spins up a fresh context every fetch, and *context* creation is the hang-prone

@@ -123,7 +123,7 @@ class FetchClient:
         """Launch the engine's browser once. Call at server startup."""
         await self._engine.start()
         self._started = True
-        self._born = asyncio.get_event_loop().time()
+        self._born = asyncio.get_running_loop().time()
 
     async def stop(self):
         """Close the engine's browser. Call at server shutdown."""
@@ -157,7 +157,7 @@ class FetchClient:
             except Exception:
                 pass
             await self._engine.start()
-            self._born = asyncio.get_event_loop().time()
+            self._born = asyncio.get_running_loop().time()
         finally:
             for _ in range(acquired):
                 self._semaphore.release()
@@ -187,7 +187,7 @@ class FetchClient:
         if (
             self._recycle_ttl > 0
             and self._born
-            and asyncio.get_event_loop().time() - self._born > self._recycle_ttl
+            and asyncio.get_running_loop().time() - self._born > self._recycle_ttl
         ):
             self._needs_restart = True
 
@@ -259,7 +259,7 @@ class FetchClient:
             text = ""
             prev_len = 0
             stable_count = 0
-            poll_start = asyncio.get_event_loop().time()
+            poll_start = asyncio.get_running_loop().time()
             for i in range(12):
                 await page.wait_for_timeout(random.randint(400, 600))
                 text = await self._engine.capture_text(page)
@@ -274,7 +274,7 @@ class FetchClient:
                     stable_count = 0
                 prev_len = cur_len
                 # If 15s elapsed and we have content, stop waiting — something's wrong
-                if asyncio.get_event_loop().time() - poll_start > 15 and cur_len > 0:
+                if asyncio.get_running_loop().time() - poll_start > 15 and cur_len > 0:
                     break
 
             # Late cookie/consent banners (SPA frameworks inject them after the
