@@ -8,7 +8,7 @@ help:
 	@echo "Detected environment: $(ENV)"
 	@echo ""
 	@echo "  make setup   - Install dependencies + Playwright browsers"
-	@echo "  make server  - Start server (reads PORT from .env)"
+	@echo "  make server  - Start server (runs setup first; reads PORT from .env)"
 	@echo "  make kill    - Stop server"
 	@echo "  make logs    - Tail server logs"
 	@echo "  make ping    - Health check"
@@ -19,6 +19,20 @@ setup:
 	@poetry install
 	@echo "→ Installing Patchright browsers..."
 	@poetry run patchright install chromium
+	@echo "→ Ensuring Chromium system libs (libnspr4, libnss3, …)..."
+	@if dpkg -s libnspr4 libnss3 >/dev/null 2>&1; then \
+		echo "  ✓ system libs present"; \
+	else \
+		echo "  Missing — running 'sudo patchright install-deps chromium'"; \
+		sudo $$(poetry env info --path)/bin/patchright install-deps chromium; \
+	fi
+	@echo "→ Ensuring pdftotext (PDF extraction fallback)..."
+	@if command -v pdftotext >/dev/null 2>&1; then \
+		echo "  ✓ pdftotext present"; \
+	else \
+		echo "  Missing — running 'sudo apt-get install -y poppler-utils'"; \
+		sudo apt-get install -y poppler-utils; \
+	fi
 	@echo "✓ Setup complete"
 
 install: setup
@@ -29,7 +43,7 @@ install: setup
 	chmod +x ~/.local/bin/fetch
 	@echo "✓ Installed 'fetch' to ~/.local/bin/fetch"
 
-server:
+server: setup
 	@echo "Stopping existing server..."
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 		curl -sf --max-time 5 -X POST http://127.0.0.1:$${PORT:-5006}/shutdown >/dev/null 2>&1 || true
