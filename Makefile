@@ -7,7 +7,7 @@ help:
 	@echo ""
 	@echo "Detected environment: $(ENV)"
 	@echo ""
-	@echo "  make setup   - Install deps + the invisible engine (stealth Firefox, default)"
+	@echo "  make setup   - Install deps + the invisible engine (stealth Firefox, default) + pdftotext"
 	@echo "  make chrome  - Also install the chrome engine (FETCH_UX_ENGINE=chrome)"
 	@echo "  make server  - Start server (reads PORT from .env)"
 	@echo "  make kill    - Stop server"
@@ -20,12 +20,26 @@ setup:
 	@poetry install
 	@echo "→ Installing stealth Firefox (invisible engine, the default; ~100MB)..."
 	@poetry run python -m invisible_playwright fetch
+	@echo "→ Ensuring pdftotext (PDF extraction, engine-agnostic)..."
+	@if command -v pdftotext >/dev/null 2>&1; then \
+		echo "  ✓ pdftotext present"; \
+	else \
+		echo "  Missing — running 'sudo apt-get install -y poppler-utils'"; \
+		sudo apt-get install -y poppler-utils; \
+	fi
 	@echo "✓ Setup complete (run under xvfb — the engine is headed)."
 	@echo "  Optional chrome engine (FETCH_UX_ENGINE=chrome): run 'make chrome'"
 
 chrome:
 	@echo "→ Installing real Google Chrome for the chrome engine..."
 	@poetry run patchright install chrome
+	@echo "→ Ensuring Chromium system libs (libnspr4, libnss3, …)..."
+	@if dpkg -s libnspr4 libnss3 >/dev/null 2>&1; then \
+		echo "  ✓ system libs present"; \
+	else \
+		echo "  Missing — running 'sudo patchright install-deps chromium'"; \
+		sudo $$(poetry env info --path)/bin/patchright install-deps chromium; \
+	fi
 	@echo "✓ Chrome ready — set FETCH_UX_ENGINE=chrome to use it"
 
 install: setup
