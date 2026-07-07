@@ -172,19 +172,30 @@ class InvisibleEngine(BaseEngine):
         """Read rendered text (incl. closed Shadow DOM) back via the OS clipboard.
 
         Ctrl+A/Ctrl+C puts the selection on the X11 clipboard; we read it with
-        `xclip`, NOT page.evaluate. evaluate runs in Firefox's main world, so a
-        strict page CSP (`script-src` without `unsafe-eval` — HN always, Roche
-        intermittently) blocks the eval() Playwright uses to run it: it either
-        throws "call to eval() blocked by CSP" or hangs the whole fetch to timeout.
-        A subprocess reading the clipboard never touches the page, so CSP can't
-        reach it. The copy+read is serialized (`_clip_lock`) because the clipboard
-        is global per display.
+        `xclip`. Select-then-copy is what reaches closed shadow roots that
+        `innerText` / `locator.inner_text()` can't see (Roche pipeline, etc.).
+        Subprocess clipboard read is CSP-proof — page-world JS can't reach it,
+        so strict-CSP sites (Reddit, HN, Roche intermittently) work.
 
-        The same CSP rule previously broke action discovery and the scroll action
-        (both used raw page.evaluate strings). Those were moved to locator-based
-        + mouse wheel calls so the invisible engine now works on HN and similar sites.
+        Firefox's Ctrl+A only selects when the *document* has focus, and a fresh
+        tab leaves focus on the URL bar (or nothing) until the user clicks. So
+        we click the (1,1) pixel first — exactly what a user does when they
+        click on the page before pressing Ctrl+A. (1,1) is inside the html
+        element's edge, well outside any normal interactive region. Without
+        this click, sites that don't autofocus content (Reddit shreddit) silently
+        returned an empty clipboard — the bug this fixes.
+
+        Pure user input throughout: a mouse click and two keystrokes. No
+        page.evaluate, no JS-side focus(), nothing CSP could block.
         """
         async with self._clip_lock:
+            # User-equivalent focus: a click on the page so Ctrl+A has a document
+            # to select in. Cheap, idempotent on repeat captures (the polling loop
+            # calls this up to 12 times per fetch — same caret position each time).
+            try:
+                await page.mouse.click(1, 1)
+            except Exception:
+                pass
             await self.select_all_and_copy(page)
             # Tiny settle: Firefox sets the X CLIPBOARD selection owner just after
             # the Ctrl+C keystroke is processed; reading instantly can race it.
