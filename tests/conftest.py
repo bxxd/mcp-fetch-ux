@@ -1,6 +1,5 @@
 """Shared fixtures for mcp-fetch-ux tests."""
 
-import asyncio
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path

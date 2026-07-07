@@ -6,3 +6,4 @@ dist/
 *.egg-info/
 logs/
 .ruff_cache/
+tmp/

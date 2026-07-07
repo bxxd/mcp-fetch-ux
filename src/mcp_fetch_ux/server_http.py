@@ -91,6 +91,89 @@ async def handle_ping(request: Request):
     return JSONResponse({"status": "ok"})
 
 
+def _coerce_int(v, default):
+    """JSON int with serde-null tolerance; raise ValueError on a bad type."""
+    if v is None:
+        return default
+    if isinstance(v, bool):  # bool is an int subclass — reject to avoid True->1
+        raise ValueError("expected an integer")
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except ValueError:
+            raise ValueError(f"invalid integer: {v!r}")
+    raise ValueError("expected an integer")
+
+
+def _coerce_bool(v, default):
+    """JSON bool with serde-null tolerance; parse strings, raise on a bad type."""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes"):
+            return True
+        if s in ("false", "0", "no", ""):
+            return False
+    raise ValueError(f"invalid boolean: {v!r}")
+
+
+async def handle_fetch_json(request: Request):
+    """Raw JSON fetch endpoint.
+
+    Same shape as the MCP `read_webpage` tool but plain HTTP — used by the
+    Rust edge at pithy.bot (and anyone else who'd rather POST JSON than wrap
+    MCP protocol). Request body:
+
+        {
+          "url": "...",
+          "actions": [...],          // optional
+          "max_length": 50000,       // optional
+          "start_index": 0,          // optional
+          "raw": false               // optional
+        }
+
+    Response: {"content": "..."} on success, {"error": "..."} on failure.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+    url = body.get("url")
+    if not url or not isinstance(url, str):
+        return JSONResponse({"error": "missing or invalid 'url'"}, status_code=400)
+
+    # Coerce optional params (serde sends Option::None as null); 400 on bad types.
+    try:
+        max_length = _coerce_int(body.get("max_length"), 50000)
+        start_index = _coerce_int(body.get("start_index"), 0)
+        raw = _coerce_bool(body.get("raw"), False)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    try:
+        content = await handlers.handle_fetch(
+            url=url,
+            actions=body.get("actions"),
+            max_length=max_length,
+            start_index=start_index,
+            raw=raw,
+        )
+        return JSONResponse({"content": content})
+    except handlers.UnsafeUrl as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception:
+        # Don't leak internals (paths, versions) to the client; log for debugging.
+        logger.exception("handle_fetch_json failed")
+        return JSONResponse({"error": "internal error"}, status_code=500)
+
+
 async def handle_shutdown(request: Request):
     await handlers.shutdown_client()
     return JSONResponse({"status": "shutdown"})
@@ -118,6 +201,7 @@ async def lifespan(app):
 app = Starlette(
     routes=[
         Route("/ping", handle_ping, methods=["GET"]),
+        Route("/fetch", handle_fetch_json, methods=["POST"]),
         Mount("/mcp", app=transport.handle_request),
         Route("/sse", handle_sse),
         Mount("/messages", app=sse.handle_post_message),

@@ -1,11 +1,82 @@
 """Tool routing and execution."""
 
+import asyncio
+import ipaddress
 import logging
+import socket
 import time
+from urllib.parse import urlparse
 
 from fetch_ux import FetchClient
 
 logger = logging.getLogger("mcp_fetch_ux")
+
+
+_DISALLOWED_SUFFIXES = (
+    ".local",
+    ".internal",
+    ".intranet",
+    ".lan",
+    ".home.arpa",
+    ".localhost",
+)
+
+
+class UnsafeUrl(ValueError):
+    """Raised when a URL points somewhere we refuse to fetch (loopback, private,
+    link-local, metadata services, non-http schemes)."""
+
+
+def _is_blocked_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # unparsable → reject
+    return (
+        ip.is_loopback
+        or ip.is_private          # covers RFC1918, CGNAT 100.64/10, ULA, etc.
+        or ip.is_link_local       # 169.254/16 (AWS+GCP+Azure metadata) and fe80::/10
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_reserved
+    )
+
+
+async def _validate_url(url: str) -> None:
+    """Raise UnsafeUrl if `url` points anywhere we refuse to fetch."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise UnsafeUrl(f"disallowed scheme: {parsed.scheme or '(none)'}")
+    host = parsed.hostname
+    if not host:
+        raise UnsafeUrl("URL has no host")
+    host_lc = host.lower()
+    if host_lc == "localhost":
+        raise UnsafeUrl(f"disallowed hostname: {host}")
+    for suffix in _DISALLOWED_SUFFIXES:
+        if host_lc.endswith(suffix):
+            raise UnsafeUrl(f"disallowed hostname: {host}")
+    # If hostname is itself an IP literal, check directly.
+    try:
+        ipaddress.ip_address(host)
+        if _is_blocked_ip(host):
+            raise UnsafeUrl(f"disallowed address: {host}")
+        return
+    except ValueError:
+        pass
+    # Resolve DNS off the event loop (getaddrinfo is blocking). Reject if ANY
+    # resolved address is blocked.
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as e:
+        raise UnsafeUrl(f"host did not resolve: {e}") from e
+    for info in infos:
+        ip_str = info[4][0]
+        if _is_blocked_ip(ip_str):
+            raise UnsafeUrl(f"disallowed address: {ip_str} (for host {host})")
 
 # Shared client — browser launched once, reused across requests
 _client: FetchClient | None = None
@@ -27,7 +98,7 @@ async def shutdown_client():
 
 
 async def call_tool(name: str, arguments: dict) -> str:
-    if name != "webpage_fetch":
+    if name != "read_webpage":
         raise ValueError(f"Unknown tool: {name}")
 
     return await handle_fetch(**arguments)
@@ -40,7 +111,12 @@ async def handle_fetch(
     start_index: int = 0,
     raw: bool = False,
 ) -> str:
-    """Fetch URL with Playwright, optionally interact, return content."""
+    """Fetch URL with real Chrome (Patchright), optionally interact, return content."""
+    # Defense in depth: the Rust edge does this too, but anyone hitting the
+    # Python worker directly (or via MCP without going through the edge) is
+    # still protected here.
+    await _validate_url(url)
+
     client = await get_client()
 
     start = time.time()

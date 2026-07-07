@@ -2,22 +2,22 @@
 
 TOOLS = [
     {
-        "name": "webpage_fetch",
+        "name": "read_webpage",
         "description": (
-            "webpage_fetch - retrieve text from a URL\n\n"
+            "read_webpage - retrieve text from a URL\n\n"
             "SYNOPSIS\n"
-            "  webpage_fetch(url, [actions], [max_length], [start_index], [raw])\n\n"
+            "  read_webpage(url, [actions], [max_length], [start_index], [raw])\n\n"
             "USAGE\n"
             "  1. Call with a URL. Get back page text and available actions.\n"
             "  2. To interact, pass actions from the response back in the actions parameter.\n"
             "  3. Chain calls to navigate multi-page workflows (search, paginate, download).\n"
             "  4. If response is truncated, call again with start_index to continue reading.\n"
-            "  5. If the site blocks you (403), switch to grok_blocked_webpage_fetch.\n\n"
+            "  5. Some sites block automated access (403/captcha) — not every page is fetchable.\n\n"
             "RETURNS\n"
             "  Page text + list of discovered actions (buttons, links, forms).\n"
             "  File downloads (CSV, PDF, XLSX) return file content directly.\n\n"
             "LIMITS\n"
-            "  30-second timeout. No cookie persistence between calls."
+            "  30-second timeout. Cookies persist in one shared session, rotated periodically."
         ),
         "inputSchema": {
             "type": "object",

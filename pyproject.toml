@@ -1,8 +1,9 @@
 [tool.poetry]
 name = "mcp-fetch-ux"
 version = "0.1.0"
-description = "Playwright-based web fetch MCP server with Readability extraction"
+description = "Real-Chrome (Patchright) web-fetch MCP server with clipboard extraction"
 authors = ["idio"]
+license = "MIT"
 readme = "DEVELOPER.md"
 packages = [
     { include = "fetch_ux", from = "src" },
@@ -12,13 +13,13 @@ packages = [
 [tool.poetry.dependencies]
 python = "^3.11"
 playwright = "^1.49"
-markdownify = ">=0.13.1"
-readabilipy = ">=0.2.0"
 mcp = "^1.0.0"
 starlette = "^0.41.0"
 uvicorn = "^0.32.0"
 python-dotenv = "^1.0.0"
-patchright = "^1.58.2"
+# Browser engines (hexagonal — selected via FETCH_UX_ENGINE):
+patchright = "^1.58.2"   # chrome engine: real Chrome stealth
+invisible-playwright = { git = "https://github.com/bxxd/forked-invisible_playwright.git", branch = "forked-main" }  # invisible engine (default): stealth Firefox — our fork, tracks forked-main
 
 [tool.poetry.group.dev.dependencies]
 ruff = ">=0.7.0"

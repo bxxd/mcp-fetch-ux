@@ -1,0 +1,28 @@
+[Unit]
+Description=mcp-fetch-ux — stealth-Firefox web fetch worker (invisible_playwright)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/work/dev/mcp-fetch-ux
+Environment=PORT=5017
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.cache/pypoetry/virtualenvs/mcp-fetch-ux-TM0Unpyq-py3.12/bin:/usr/bin
+# Default engine: invisible (stealth Firefox — beats reCAPTCHA incl. Google).
+# Override to "chrome" (real Chrome via Patchright) per host if desired.
+Environment=FETCH_UX_ENGINE=invisible
+# Optional per-host overrides (PORT, FETCH_UX_ENGINE, FETCH_UX_HEADLESS, venv path).
+# The "-" makes it non-fatal if absent.
+EnvironmentFile=-/etc/default/mcp-fetch-ux
+# Both engines run a real browser headed → need a display; xvfb-run supplies a
+# virtual one. (FETCH_UX_HEADLESS=1 forces headless, more detectable.) The venv
+# path below is host-specific — override via EnvironmentFile on other machines.
+ExecStart=/usr/bin/xvfb-run -a /home/ubuntu/.cache/pypoetry/virtualenvs/mcp-fetch-ux-TM0Unpyq-py3.12/bin/python -m mcp_fetch_ux.server_http
+Restart=on-failure
+RestartSec=5
+# Patchright wants this for chromium sandbox
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
