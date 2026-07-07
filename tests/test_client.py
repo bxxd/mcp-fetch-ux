@@ -95,20 +95,23 @@ async def test_scroll_action(client, local_server):
 
 @pytest.mark.asyncio
 async def test_stealth_fingerprints(client, local_server):
-    """Real Chrome (Patchright) presents a coherent fingerprint — no manual masks.
-
-    We assert the truthful signals real Chrome exposes, not the faked ones the
-    old init-script path injected. (window.chrome.runtime is intentionally NOT
-    asserted: real Chrome doesn't expose it on a plain page, and faking it was
-    itself a detectable tell — coherence over masking.)
-    """
+    """Whichever engine is active presents a coherent fingerprint with no manual
+    masks — assert the truthful signals it exposes. `window.chrome` is Chromium-
+    only, so it's checked only for the chrome engine (Firefox legitimately has no
+    window.chrome — and faking it would be a tell)."""
     result = await client.fetch(f"{local_server}/stealth.html", max_length=50000)
     # Parse the JSON from the page
     data = json.loads(result.content.strip())
     assert data["webdriver"] is False, "navigator.webdriver should be false"
-    assert data["plugins_length"] > 0, "real Chrome exposes plugins"
+    # Chromium always exposes a non-empty plugins list; real Firefox can legitimately
+    # report 0 (and faking it would itself be a tell), so only require a sane count there.
+    if client._engine.name == "chrome":
+        assert data["plugins_length"] > 0, "Chromium should expose plugins"
+    else:
+        assert data["plugins_length"] >= 0, "plugins length should be reported as a count"
     assert "en-US" in data["languages"], "navigator.languages should include en-US"
-    assert data["chrome"] is True, "window.chrome should exist"
+    if client._engine.name == "chrome":
+        assert data["chrome"] is True, "window.chrome should exist on Chromium"
 
 
 @pytest.mark.asyncio

@@ -1,22 +1,27 @@
-"""Playwright-based web fetcher with clipboard extraction.
+"""Engine-agnostic web fetcher with clipboard extraction.
 
-Renders JS, captures visible text (including Shadow DOM) via Ctrl+A/Ctrl+C.
-Supports page interactions (click, fill, wait) and file downloads.
-30s timeout. No LLM. No cost.
+Renders JS, captures visible text (including closed Shadow DOM) via Ctrl+A/Ctrl+C,
+runs page interactions (click, fill, wait), and returns file downloads. No LLM,
+no cost. This core holds zero browser-specific code.
+
+The browser is a swappable port (`fetch_ux.engines`, picked via FETCH_UX_ENGINE):
+- `invisible` (default) — a C++-fingerprint-patched Firefox that passes reCAPTCHA v3
+  including Google SERP, where Chromium-based stealth hits a ceiling.
+- `chrome` — real Google Chrome via Patchright, for Cloudflare/Datadome-class walls.
+Both drive a real browser headed, so they need a display — run under xvfb.
 """
 
 import asyncio
 import logging
 import os
 import random
-import shutil
 import subprocess
-import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from patchright.async_api import async_playwright, Download
+from playwright.async_api import Download
+
+from fetch_ux.engines import make_engine
 
 logger = logging.getLogger("fetch_ux")
 
@@ -77,139 +82,85 @@ def _int_env(name: str, default: int) -> int:
 
 
 class FetchClient:
-    """Fetches URLs with real Chrome (Patchright) + clipboard extraction.
+    """Fetches URLs: a swappable browser engine + clipboard extraction.
 
-    One engine, no fallback: real Google Chrome via a persistent context. Needs
-    Chrome installed (`patchright install chrome`) and a display — run headed under
-    xvfb on a server; `FETCH_UX_HEADLESS=1` forces headless (more detectable).
+    Hexagonal — the browser is a port (`fetch_ux.engines.BrowserEngine`). This
+    core only does extraction (clipboard/Shadow-DOM capture, overlay dismissal,
+    actions, downloads, truncation) on a Playwright Page; *which* browser produces
+    that page is the adapter's job. Pick it with FETCH_UX_ENGINE (default
+    `invisible` — stealth Firefox that beats reCAPTCHA v3; or `chrome`).
+
+    Periodic recycle (FETCH_UX_RECYCLE_TTL, default 1 day) rotates the session —
+    cookies for Chrome, fingerprint for invisible.
     """
 
     def __init__(
         self,
         timeout_ms: int = 60_000,
+        engine=None,
         *,
-        headless: bool | None = None,
-        cookie_ttl_sec: int | None = None,
+        recycle_ttl_sec: int | None = None,
     ):
         self.timeout_ms = timeout_ms
-        # Patchright is most undetectable headed (run under xvfb); headless is more
-        # detectable. Default headed.
-        self._headless = (
-            headless if headless is not None
-            else os.environ.get("FETCH_UX_HEADLESS", "0") == "1"
-        )
-        # Throw the shared cookie jar away on a timer so one flagged session can't
-        # poison us forever. Routed through the recycle path. 0 = never.
+        self._engine = engine if engine is not None else make_engine(timeout_ms)
         ttl = (
-            cookie_ttl_sec if cookie_ttl_sec is not None
-            else _int_env("FETCH_UX_COOKIE_TTL", 86400)
+            recycle_ttl_sec if recycle_ttl_sec is not None
+            else _int_env("FETCH_UX_RECYCLE_TTL", 86400)
         )
-        self._cookie_ttl = max(0, ttl)  # negative is meaningless; 0 = never rotate
-        self._context = None          # persistent BrowserContext — the one engine
-        self._user_data_dir: str | None = None
-        self._context_born: float = 0.0
-        self._pw = None
-        self._semaphore = asyncio.Semaphore(3)
+        self._recycle_ttl = max(0, ttl)  # negative is meaningless; 0 = never recycle
+        self._started = False
+        self._born: float = 0.0
+        # Size the fetch gate from what the engine declares it can safely run at once
+        # (invisible=1: single Firefox deadlocks on concurrent target creation;
+        # chrome=3: Chromium isolates per context). Falls back to 1 for any engine
+        # that doesn't declare it. Stored so recycle can drain exactly this many.
+        self._concurrency = getattr(self._engine, "concurrency", 1)
+        self._semaphore = asyncio.Semaphore(self._concurrency)
         self._needs_restart = False
         self._recycle_lock = asyncio.Lock()
 
     async def start(self):
-        """Launch real Chrome once. Call at server startup.
-
-        One persistent context (real Google Chrome via channel="chrome") = a warm,
-        shared cookie jar. No UA spoof, no Sec-CH-UA, no AutomationControlled flag,
-        no init scripts: real Chrome + Patchright present a coherent fingerprint;
-        layering manual masks on top only creates detectable inconsistencies.
-        """
-        self._pw = await async_playwright().start()
-        # Fresh profile dir each launch → recycling (incl. the daily TTL) wipes
-        # cookies for free.
-        self._user_data_dir = tempfile.mkdtemp(prefix="fetchux-chrome-")
-        try:
-            self._context = await self._pw.chromium.launch_persistent_context(
-                self._user_data_dir,
-                channel="chrome",          # real Google Chrome, not bundled Chromium
-                headless=self._headless,
-                no_viewport=True,          # use the real window size; don't fingerprint
-                locale="en-US",
-                permissions=["clipboard-read", "clipboard-write"],
-                accept_downloads=True,
-                args=self._chrome_args(),
-            )
-        except Exception:
-            # If Chrome is missing/misconfigured, don't leak the temp profile or
-            # the started Playwright process.
-            self._remove_dir(self._user_data_dir)
-            self._user_data_dir = None
-            try:
-                await self._pw.stop()
-            except Exception:
-                pass
-            self._pw = None
-            raise
-        self._context.set_default_timeout(self.timeout_ms)
-        self._context_born = time.monotonic()
-        logger.info(
-            "FetchClient: Chrome up (channel=chrome, headless=%s, profile=%s)",
-            self._headless, self._user_data_dir,
-        )
-
-    @staticmethod
-    def _remove_dir(path: str | None):
-        if path:
-            shutil.rmtree(path, ignore_errors=True)
-
-    @staticmethod
-    def _chrome_args() -> list[str]:
-        """If a DRM render node is present (a GPU was passed into the container),
-        drive WebGL through it via ANGLE/EGL so the renderer reports the real GPU
-        instead of 'WebGL: False' — a glaring automation tell. No-op without a GPU,
-        so this stays safe on GPU-less hosts."""
-        if os.path.exists("/dev/dri/renderD128"):
-            return [
-                "--use-gl=angle",
-                "--use-angle=gl-egl",   # ANGLE over native EGL → Mesa iris → render node
-                "--ignore-gpu-blocklist",
-                "--enable-gpu-rasterization",
-            ]
-        return []
+        """Launch the engine's browser once. Call at server startup."""
+        await self._engine.start()
+        self._started = True
+        self._born = asyncio.get_running_loop().time()
 
     async def stop(self):
-        """Close browser. Call at server shutdown."""
-        if self._context:
-            try:
-                await asyncio.wait_for(self._context.close(), timeout=5.0)
-            except Exception:
-                pass
-        if self._pw:
-            await self._pw.stop()
-        self._remove_dir(self._user_data_dir)
+        """Close the engine's browser. Call at server shutdown."""
+        try:
+            await self._engine.stop()
+        finally:
+            self._started = False
 
     async def _recycle_browser(self):
-        """Swap in a fresh context — to flush a stuck renderer, and to throw the
-        cookie jar away when the TTL expires (which routes here too).
+        """Flush a stuck renderer / rotate the session: stop then restart the engine.
 
-        Starts fresh (new fetches use it immediately), then closes the old one.
-        In-flight fetches finish naturally on the old context.
+        Drains the fetch gate first — acquires every semaphore permit so no fetch is
+        inside `_fetch_impl` when we stop the browser. Otherwise stopping invalidates
+        the pages those in-flight fetches hold, failing unrelated requests. In-flight
+        fetches finish and release their permits; new ones block on the gate until the
+        fresh browser is up. (The triggering fetch hasn't taken its permit yet — it
+        acquires the gate only after this returns — so there's no self-deadlock.)
         """
-        logger.warning("Recycling Chrome — flushing renderer / rotating cookies")
-        old_ctx, old_pw, old_dir = self._context, self._pw, self._user_data_dir
-        self._context = None
-        self._needs_restart = False
+        acquired = 0
         try:
-            await self.start()
-        except Exception:
-            self._context, self._pw, self._user_data_dir = old_ctx, old_pw, old_dir
-            self._needs_restart = True
-            raise
-        if old_ctx:
+            for _ in range(self._concurrency):
+                await self._semaphore.acquire()
+                acquired += 1
+            logger.warning(
+                "Recycling engine=%s — flushing renderer / rotating session",
+                getattr(self._engine, "name", "?"),
+            )
+            self._needs_restart = False
             try:
-                await asyncio.wait_for(old_ctx.close(), timeout=5.0)
+                await self._engine.stop()
             except Exception:
                 pass
-        if old_pw:
-            await old_pw.stop()
-        self._remove_dir(old_dir)  # discard the old cookie profile
+            await self._engine.start()
+            self._born = asyncio.get_running_loop().time()
+        finally:
+            for _ in range(acquired):
+                self._semaphore.release()
 
     async def fetch(
         self,
@@ -228,15 +179,15 @@ class FetchClient:
             start_index: Start content extraction at this char index.
             raw: Return raw HTML instead of clipboard text.
         """
-        if self._context is None:
+        if not self._started:
             await self.start()
 
-        # Daily cookie throw-away: expire the warm jar so a flagged session can't
-        # poison us forever. Routes through the same recycle path as stuck renderers.
+        # Periodic recycle: rotate the session so a flagged one can't poison us
+        # forever. Routes through the same recycle path as stuck renderers.
         if (
-            self._cookie_ttl > 0
-            and self._context_born
-            and time.monotonic() - self._context_born > self._cookie_ttl
+            self._recycle_ttl > 0
+            and self._born
+            and asyncio.get_running_loop().time() - self._born > self._recycle_ttl
         ):
             self._needs_restart = True
 
@@ -254,26 +205,43 @@ class FetchClient:
             except asyncio.TimeoutError:
                 raise TimeoutError(f"Timed out after {self.timeout_ms // 1000}s fetching {url}")
 
-    def _closer(self, closeable, kind: str):
-        """Build the per-fetch release coroutine; on a close hang, flag a recycle."""
-        async def _release(url: str = ""):
+    async def _goto(self, page, url: str):
+        """Navigate, retrying once on a transient 'interrupted by another navigation'.
+        A freshly opened tab can fire an internal about:blank/about:newtab navigation
+        that interrupts the first goto; the retry lands after it settles."""
+        for attempt in range(2):
             try:
-                await asyncio.wait_for(closeable.close(), timeout=5.0)
-            except Exception:
-                if not self._recycle_lock.locked():
-                    self._needs_restart = True
-                logger.warning("%s.close() timed out for %s — scheduling recycle", kind, url)
-        return _release
+                return await page.goto(
+                    url, wait_until="domcontentloaded", timeout=self.timeout_ms
+                )
+            except Exception as e:
+                if attempt == 0 and "interrupted by another navigation" in str(e):
+                    continue
+                raise
 
-    async def _acquire_page(self):
-        """Open a page on the warm persistent context (shared cookie jar). The
-        context stays alive; only the page is closed after the fetch."""
-        page = await self._context.new_page()
-        try:
-            page.set_default_timeout(self.timeout_ms)
-        except Exception:
-            pass
-        return page, self._closer(page, "page")
+    @staticmethod
+    async def _collect_disk_download(dl_dir, before, settle=2.0, timeout=20.0):
+        """For engines that save downloads to disk instead of firing Playwright's
+        download event (invisible Firefox): poll `dl_dir` for a new *completed* file
+        (Firefox writes a `.part` while in flight, renames when done). Returns
+        (path, filename) or None. Waits up to `settle` for a download to even start,
+        then up to `timeout` for it to finish."""
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while loop.time() - start < timeout:
+            try:
+                new = set(os.listdir(dl_dir)) - before
+            except OSError:
+                return None
+            done = [f for f in new if not f.endswith((".part", ".tmp", ".crdownload"))]
+            if done:
+                newest = max(done, key=lambda n: os.path.getmtime(os.path.join(dl_dir, n)))
+                return os.path.join(dl_dir, newest), newest
+            # Nothing started within the settle window → this fetch has no download.
+            if not new and (loop.time() - start) > settle:
+                return None
+            await asyncio.sleep(0.25)
+        return None
 
     async def _fetch_impl(
         self,
@@ -286,22 +254,40 @@ class FetchClient:
         download_file: Download | None = None
         download_content: str | None = None
 
-        page, _release_page = await self._acquire_page()
+        page = await self._engine.acquire_page()
+        ok = False
+        popups: list = []
+        # Engines that can't use Playwright's download event (invisible Firefox) save
+        # files to disk instead, into one browser-global dir shared by every tab. We
+        # snapshot that dir just before running actions and diff after — but only while
+        # holding the engine's download_lock, so a concurrent fetch's download can't land
+        # in our diff and get misattributed (or deleted out from under it). The snapshot
+        # is taken below, inside the lock; the action-less hot path skips all of this.
+        dl_dir = getattr(self._engine, "download_dir", None)
+        dl_lock = getattr(self._engine, "download_lock", None)
+        dl_before: set = set()
+
+        def _on_download(d: Download):
+            nonlocal download_file
+            download_file = d
+
+        def _on_popup(p):
+            # Some sites export a file by opening a new tab that then downloads (CSV/PDF
+            # "open in new window"). Catch downloads there too, and track the popup so we
+            # can close it — like a real user's browser, which handles the popup download.
+            popups.append(p)
+            p.on("download", _on_download)
+
+        # Named handlers (not lambdas) so we can remove them before releasing — the tab
+        # is reused by later fetches, and stale listeners would pile up.
+        page.on("download", _on_download)
+        page.on("popup", _on_popup)
         try:
-            # Listen for downloads
-            page.on("download", lambda d: _capture_download(d))
-
-            def _capture_download(d: Download):
-                nonlocal download_file
-                download_file = d
-
-            response = await page.goto(
-                url, wait_until="domcontentloaded", timeout=self.timeout_ms
-            )
+            response = await self._goto(page, url)
             status = response.status if response else 0
 
             try:
-                await asyncio.wait_for(self._dismiss_overlays(page), timeout=2.0)
+                await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=2.0)
             except (asyncio.TimeoutError, Exception):
                 pass
 
@@ -312,12 +298,10 @@ class FetchClient:
             text = ""
             prev_len = 0
             stable_count = 0
-            poll_start = asyncio.get_event_loop().time()
+            poll_start = asyncio.get_running_loop().time()
             for i in range(12):
                 await page.wait_for_timeout(random.randint(400, 600))
-                await page.keyboard.press("Control+a")
-                await page.keyboard.press("Control+c")
-                text = await page.evaluate("navigator.clipboard.readText()")
+                text = await self._engine.capture_text(page)
                 cur_len = len(text)
                 # Stable = <0.5% change (dynamic ads/counters jitter slightly)
                 delta = abs(cur_len - prev_len) / max(cur_len, 1)
@@ -329,34 +313,81 @@ class FetchClient:
                     stable_count = 0
                 prev_len = cur_len
                 # If 15s elapsed and we have content, stop waiting — something's wrong
-                if asyncio.get_event_loop().time() - poll_start > 15 and cur_len > 0:
+                if asyncio.get_running_loop().time() - poll_start > 15 and cur_len > 0:
                     break
 
-            # Run actions
-            if actions:
-                # Dismiss any overlays that appeared after content load
-                try:
-                    await asyncio.wait_for(self._dismiss_overlays(page), timeout=5.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
-                for act in actions:
-                    await self._run_action(page, act)
-                    # Check if a download was triggered
-                    if download_file:
-                        break
-                    # Human-like pause between actions
-                    await page.wait_for_timeout(random.randint(100, 400))
+            # Late cookie/consent banners (SPA frameworks inject them after the
+            # initial dismiss). Now that content is rendered, try once more — and if
+            # we actually removed one, re-capture so its text isn't in the output.
+            try:
+                if await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=3.0):
+                    await page.wait_for_timeout(300)
+                    text = await self._engine.capture_text(page)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
-            # If a download was triggered, read its content
+            # Run actions + resolve any download they triggered. For disk-download
+            # engines (shared dir) this whole window is serialized on download_lock so
+            # the snapshot/diff can't collide with a concurrent fetch's download; the
+            # action-less path holds no lock and stays concurrent.
             download_filename = None
-            if download_file:
-                path = await download_file.path()
-                download_filename = download_file.suggested_filename
-                if path:
-                    download_url = download_file.url or url
-                    download_content = _read_download(path, download_filename, download_url)
+            use_dl_lock = bool(dl_dir and dl_lock and actions)
+            if use_dl_lock:
+                await dl_lock.acquire()
+            try:
+                if actions:
+                    # Snapshot the shared download dir now (inside the lock) so anything
+                    # new after the actions is unambiguously this fetch's download.
+                    if dl_dir and os.path.isdir(dl_dir):
+                        dl_before = set(os.listdir(dl_dir))
 
-            title = await page.title()
+                    # Dismiss overlays again right before actions — some sites (Roche)
+                    # re-show or delay their OneTrust modal until after initial load.
+                    for _ in range(2):
+                        try:
+                            await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=4.0)
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+                        await page.wait_for_timeout(300)
+
+                    for act in actions:
+                        await self._run_action(page, act)
+                        # Check if a download was triggered
+                        if download_file:
+                            break
+                        # Human-like pause between actions
+                        await page.wait_for_timeout(random.randint(100, 400))
+
+                # If a download was triggered, read its content.
+                if download_file:
+                    # Playwright download event (Chromium).
+                    path = await download_file.path()
+                    download_filename = download_file.suggested_filename
+                    if path:
+                        download_url = download_file.url or url
+                        download_content = _read_download(path, download_filename, download_url)
+                elif dl_dir and actions:
+                    # Disk-based capture (invisible Firefox): the file was saved to the
+                    # download dir. Grab the new file, read it, then delete it so the dir
+                    # doesn't accumulate and the next fetch's snapshot stays clean.
+                    got = await self._collect_disk_download(dl_dir, dl_before)
+                    if got:
+                        path, download_filename = got
+                        download_content = _read_download(path, download_filename, url)
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+            finally:
+                if use_dl_lock:
+                    dl_lock.release()
+
+            # Best-effort: a late client-side navigation (some SPAs) can destroy the
+            # execution context right here; the title isn't worth failing the fetch.
+            try:
+                title = await page.title()
+            except Exception:
+                title = ""
 
             if download_content is not None:
                 content = download_content
@@ -365,15 +396,29 @@ class FetchClient:
             else:
                 # Re-capture clipboard after actions (content may have changed)
                 if actions:
-                    await page.keyboard.press("Control+a")
-                    await page.keyboard.press("Control+c")
-                    text = await page.evaluate("navigator.clipboard.readText()")
+                    text = await self._engine.capture_text(page)
                 content = text
 
             # Discover available actions on the page
             actions_available = await self._discover_actions(page)
+            ok = True
         finally:
-            await _release_page(url)
+            try:
+                page.remove_listener("download", _on_download)
+                page.remove_listener("popup", _on_popup)
+            except Exception:
+                pass
+            # Close any popups this fetch opened (a popup download was already read
+            # above) so they don't accumulate in the reused context.
+            for p in popups:
+                try:
+                    await p.close()
+                except Exception:
+                    pass
+            # Healthy tab → back to the pool for reuse; a failed fetch's tab is
+            # discarded so the next fetch starts clean (engine decides — see
+            # BaseEngine/InvisibleEngine.release_page).
+            await self._engine.release_page(page, ok=ok)
 
         original_length = len(content)
         truncated = False
@@ -410,100 +455,124 @@ class FetchClient:
         )
 
     async def _discover_actions(self, page) -> list[str]:
-        """Find interactive elements on the page the agent can use."""
+        """Find interactive elements the agent can act on.
+
+        This version uses Playwright locators from the Python side (driver protocol).
+        It is CSP-safe: it does not require page.evaluate("..."), so it works on
+        strict sites like news.ycombinator.com that block 'unsafe-eval'.
+
+        We prioritize completeness ("get all the actions") over micro-optimizing
+        latency. Caps are set reasonably high; the final result is still truncated
+        to 50 actions.
+        """
+        actions: list[str] = []
+        seen: set[str] = set()
+
+        def add(desc: str) -> None:
+            if desc not in seen and len(desc) < 200:
+                seen.add(desc)
+                actions.append(desc)
+
         try:
-            return await page.evaluate("""() => {
-                const actions = [];
-                const seen = new Set();
+            # Buttons
+            button_locator = page.locator("button:visible")
+            button_texts = await button_locator.all_text_contents()
+            for text in button_texts[:60]:
+                t = (text or "").strip()
+                if 2 <= len(t) <= 80:
+                    safe = t.replace("'", "\\'")
+                    add(f'click: "button:has-text(\'{safe}\')"')
 
-                // Helper to add unique action
-                function add(action) {
-                    if (!seen.has(action) && action.length < 200) {
-                        seen.add(action);
-                        actions.push(action);
-                    }
-                }
-
-                // Buttons with visible text
-                document.querySelectorAll('button').forEach(el => {
-                    const text = el.textContent?.trim();
-                    if (text && text.length > 1 && text.length < 80 && el.offsetParent !== null) {
-                        add('click: "button:has-text(\\'' + text.replace(/'/g, "\\\\'") + '\\')"');
-                    }
-                });
-
-                // Links with text (not nav/footer)
-                document.querySelectorAll('a[href]').forEach(el => {
-                    const text = el.textContent?.trim();
-                    if (text && text.length > 1 && text.length < 80 && el.offsetParent !== null) {
-                        const href = el.getAttribute('href');
-                        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-                            add('click: "a:has-text(\\'' + text.replace(/'/g, "\\\\'") + '\\')" → ' + href.substring(0, 80));
-                        }
-                    }
-                });
-
-                // Elements with onclick window.location (clickable divs etc.)
-                document.querySelectorAll('[onclick]').forEach(el => {
-                    const onclick = el.getAttribute('onclick') || '';
-                    const m = onclick.match(/window\.location\s*=\s*['"]([^'"]+)['"]/);
-                    if (m && el.offsetParent !== null) {
-                        const href = m[1];
-                        const text = el.querySelector('.post-title, h1, h2, h3')?.textContent?.trim()
-                            || el.textContent?.trim().substring(0, 60);
-                        if (text) {
-                            add('click: "[onclick]" → ' + href + ' (' + text.replace(/\s+/g, ' ') + ')');
-                        }
-                    }
-                });
-
-                // Download links
-                document.querySelectorAll('a[download], a[href$=".csv"], a[href$=".pdf"], a[href$=".xlsx"]').forEach(el => {
-                    const text = el.textContent?.trim() || el.getAttribute('download') || el.href;
-                    add('download: "' + text + '"');
-                });
-
-                // Input fields
-                document.querySelectorAll('input:not([type=hidden]), textarea, select').forEach(el => {
-                    const name = el.name || el.id || el.getAttribute('aria-label') || el.type;
-                    if (name && el.offsetParent !== null) {
-                        const tag = el.tagName.toLowerCase();
-                        if (tag === 'select') {
-                            const opts = Array.from(el.options).slice(0, 5).map(o => o.text).join(', ');
-                            add('select: "' + name + '" options=[' + opts + ']');
-                        } else {
-                            add('fill: "' + name + '" (' + (el.type || tag) + ')');
-                        }
-                    }
-                });
-
-                return actions.slice(0, 50);  // Cap at 50
-            }""")
-        except Exception:
-            return []
-
-    async def _dismiss_overlays(self, page):
-        """Dismiss cookie/consent overlays blocking interaction."""
-        for selector in [
-            "#onetrust-reject-all-handler",
-            "#onetrust-accept-btn-handler",
-            "button:has-text('Accept All')",
-            "button:has-text('Reject All')",
-            "button:has-text('Accept')",
-            "button:has-text('OK')",
-            "button:has-text('I Agree')",
-            "[id*='cookie'] button",
-            "[class*='cookie'] button",
-            "[id*='consent'] button",
-        ]:
+            # Links (the most important source on most real pages)
+            link_locator = page.locator("a[href]:visible")
+            link_texts = await link_locator.all_text_contents()
+            # We still need per-element hrefs. Do them in one batched evaluate_all
+            # (this is still safer / more contained than the old full evaluate blob).
             try:
-                btn = page.locator(selector).first
-                if await btn.is_visible(timeout=300):
-                    await btn.click(timeout=1000)
-                    await page.wait_for_timeout(500)
-                    return
+                hrefs = await link_locator.evaluate_all("els => els.map(el => el.getAttribute('href') || '')")
             except Exception:
-                continue
+                # Fallback if evaluate_all is blocked on a very strict page
+                hrefs = [""] * len(link_texts)
+
+            for text, href in zip(link_texts, hrefs):
+                t = (text or "").strip()
+                h = (href or "").strip()
+                if 2 <= len(t) <= 80 and h and not h.startswith(("#", "javascript:")):
+                    safe = t.replace("'", "\\'")
+                    add(f'click: "a:has-text(\'{safe}\')" → {h[:80]}')
+
+            # Download-oriented links (explicit or by extension)
+            download_locator = page.locator(
+                "a[download]:visible, a[href$='.csv']:visible, a[href$='.pdf']:visible, a[href$='.xlsx']:visible"
+            )
+            dl_texts = await download_locator.all_text_contents()
+            try:
+                dl_hrefs = await download_locator.evaluate_all(
+                    "els => els.map(el => el.getAttribute('href') || el.getAttribute('download') || '')"
+                )
+            except Exception:
+                dl_hrefs = [""] * len(dl_texts)
+
+            for text, href in zip(dl_texts, dl_hrefs):
+                name = (text or "").strip() or (href or "").strip()
+                if name:
+                    add(f'download: "{name[:80]}"')
+
+            # Form controls - inputs
+            input_locator = page.locator("input:not([type=hidden]):visible")
+            input_elements = await input_locator.all()
+            for el in input_elements[:30]:
+                try:
+                    name = (
+                        await el.get_attribute("name")
+                        or await el.get_attribute("id")
+                        or await el.get_attribute("aria-label")
+                        or await el.get_attribute("type")
+                        or "input"
+                    )
+                    if name:
+                        typ = await el.get_attribute("type") or "text"
+                        add(f'fill: "{name}" ({typ})')
+                except Exception:
+                    continue
+
+            # Textareas
+            textarea_locator = page.locator("textarea:visible")
+            textarea_elements = await textarea_locator.all()
+            for el in textarea_elements[:15]:
+                try:
+                    name = (
+                        await el.get_attribute("name")
+                        or await el.get_attribute("id")
+                        or await el.get_attribute("aria-label")
+                        or "textarea"
+                    )
+                    if name:
+                        add(f'fill: "{name}" (textarea)')
+                except Exception:
+                    continue
+
+            # Selects
+            select_locator = page.locator("select:visible")
+            select_elements = await select_locator.all()
+            for el in select_elements[:15]:
+                try:
+                    name = (
+                        await el.get_attribute("name")
+                        or await el.get_attribute("id")
+                        or await el.get_attribute("aria-label")
+                        or "select"
+                    )
+                    if name:
+                        add(f'select: "{name}"')
+                except Exception:
+                    continue
+
+        except Exception:
+            # Page is hostile or closed; best effort only
+            pass
+
+        return actions[:50]
 
     async def _run_action(self, page, act: dict):
         """Execute a single page action."""
@@ -529,14 +598,19 @@ class FetchClient:
                         await page.wait_for_timeout(random.randint(50, 200))
                 except Exception:
                     pass  # Best-effort — proceed to click even if move fails
-                # Check if click triggers a download
-                try:
-                    async with page.expect_download(timeout=timeout):
-                        await loc.click(timeout=timeout)
-                    # Download was triggered — it's captured by the event listener
-                    return
-                except Exception:
-                    # No download — normal click
+                # Event-based engines (Chromium): wrap the click in expect_download so
+                # a click that triggers a download is caught. Disk-based engines
+                # (invisible Firefox) never fire that event — they capture downloads
+                # from the download dir after actions — so they click plainly; wrapping
+                # would just burn the full timeout on every non-download click.
+                if getattr(self._engine, "download_dir", None) is None:
+                    try:
+                        async with page.expect_download(timeout=timeout):
+                            await loc.click(timeout=timeout)
+                        return  # download triggered — captured by the event listener
+                    except Exception:
+                        await loc.click(timeout=timeout)  # no download — normal click
+                else:
                     await loc.click(timeout=timeout)
             except Exception as e:
                 logger.warning(f"Action click({selector}) failed: {e}")
@@ -572,8 +646,13 @@ class FetchClient:
 
         elif action == "scroll":
             direction = act.get("direction", "bottom")
-            if direction == "bottom":
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            elif direction == "top":
-                await page.evaluate("window.scrollTo(0, 0)")
+            # Use keyboard input protocol (CSP-safe, no page.evaluate).
+            # "End"/"Home" reliably jump to the actual scroll boundaries even on very tall pages.
+            try:
+                if direction == "bottom":
+                    await page.keyboard.press("End")
+                elif direction == "top":
+                    await page.keyboard.press("Home")
+            except Exception as e:
+                logger.warning(f"Action scroll({direction}) failed: {e}")
             await page.wait_for_timeout(500)

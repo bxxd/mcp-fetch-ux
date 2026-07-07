@@ -49,7 +49,9 @@ URL_B64=$(echo -n "$URL" | base64 -w0)
 
 OUTFILE_B64=$(echo -n "$OUTFILE" | base64 -w0)
 
-poetry run python3 -c "
+# Engines run a real browser headed → need a display; xvfb-run supplies a virtual
+# one so `fetch` works from a plain terminal/server.
+xvfb-run -a poetry run python3 -c "
 import asyncio, json, base64, warnings
 warnings.filterwarnings('ignore')
 

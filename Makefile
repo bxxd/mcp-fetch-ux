@@ -1,4 +1,4 @@
-.PHONY: server kill logs ping help setup install
+.PHONY: server kill logs ping help setup install chrome
 
 ENV := $(shell pwd | grep -q '/prod/' && echo prod || echo dev)
 
@@ -7,19 +7,26 @@ help:
 	@echo ""
 	@echo "Detected environment: $(ENV)"
 	@echo ""
-	@echo "  make setup   - Install dependencies + Playwright browsers"
+	@echo "  make setup   - Install deps + the invisible engine (stealth Firefox, default)"
+	@echo "  make chrome  - Also install the chrome engine (FETCH_UX_ENGINE=chrome)"
 	@echo "  make server  - Start server (reads PORT from .env)"
 	@echo "  make kill    - Stop server"
 	@echo "  make logs    - Tail server logs"
 	@echo "  make ping    - Health check"
-	@echo "  make install - Install 'fetch' CLI to ~/.local/bin/"
+	@echo "  make install - setup + install 'fetch' CLI to ~/.local/bin/"
 
 setup:
 	@echo "→ Installing dependencies..."
 	@poetry install
-	@echo "→ Installing real Google Chrome (the one engine)..."
+	@echo "→ Installing stealth Firefox (invisible engine, the default; ~100MB)..."
+	@poetry run python -m invisible_playwright fetch
+	@echo "✓ Setup complete (run under xvfb — the engine is headed)."
+	@echo "  Optional chrome engine (FETCH_UX_ENGINE=chrome): run 'make chrome'"
+
+chrome:
+	@echo "→ Installing real Google Chrome for the chrome engine..."
 	@poetry run patchright install chrome
-	@echo "✓ Setup complete"
+	@echo "✓ Chrome ready — set FETCH_UX_ENGINE=chrome to use it"
 
 install: setup
 	@mkdir -p ~/.local/bin
