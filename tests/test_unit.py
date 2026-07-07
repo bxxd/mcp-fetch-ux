@@ -224,6 +224,48 @@ async def test_recycle_waits_for_inflight_fetches():
     assert client._semaphore._value == 2
 
 
+# --- disk download capture (invisible engine's shared-dir path) ---
+
+@pytest.mark.asyncio
+async def test_collect_disk_download_picks_newest_completed(tmp_path):
+    """A completed file that wasn't in the snapshot is returned; in-flight (.part)
+    and pre-existing files are ignored."""
+    (tmp_path / "old.csv").write_text("stale")          # pre-existing → in `before`
+    before = set(os.listdir(tmp_path))
+    (tmp_path / "report.csv").write_text("a,b")         # new + completed
+    (tmp_path / "half.crdownload").write_text("...")    # new but in-flight
+    got = await FetchClient._collect_disk_download(str(tmp_path), before, settle=0.1)
+    assert got is not None
+    path, name = got
+    assert name == "report.csv"
+    assert path.endswith("report.csv")
+
+
+@pytest.mark.asyncio
+async def test_collect_disk_download_none_when_nothing_new(tmp_path):
+    (tmp_path / "old.csv").write_text("stale")
+    before = set(os.listdir(tmp_path))
+    got = await FetchClient._collect_disk_download(str(tmp_path), before, settle=0.05, timeout=0.3)
+    assert got is None
+
+
+def test_invisible_engine_exposes_download_lock():
+    """The core serializes the shared-download-dir window on this lock; it must exist
+    and be distinct from the clipboard/creation locks."""
+    from fetch_ux.engines.invisible import InvisibleEngine
+    e = InvisibleEngine()
+    assert isinstance(e.download_lock, asyncio.Lock)
+    assert e.download_lock is not e._clip_lock
+    assert e.download_lock is not e._create_lock
+
+
+def test_chrome_engine_has_no_download_lock():
+    """Chromium uses the Playwright download event, not the shared-dir path, so it
+    exposes neither download_dir nor download_lock — the core's getattr falls back."""
+    assert getattr(ChromeEngine(), "download_dir", None) is None
+    assert getattr(ChromeEngine(), "download_lock", None) is None
+
+
 # --- _validate_url (SSRF guard) — IP literals/scheme/hostname need no DNS ---
 
 @pytest.mark.asyncio

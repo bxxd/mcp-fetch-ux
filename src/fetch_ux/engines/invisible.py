@@ -71,6 +71,12 @@ class InvisibleEngine(BaseEngine):
         # event). The core reads new files from this dir and deletes them after. One
         # dir per engine; Firefox's download.dir is browser-global so the pool shares it.
         self.download_dir = tempfile.mkdtemp(prefix="fetchux-ff-dl-")
+        # The download dir is shared across all tabs, so a new file can't be attributed
+        # to a tab by inspection. The core serializes the download window (snapshot →
+        # actions → collect) on this lock, so at most one disk-download fetch is in that
+        # window at a time and any new file in it is unambiguously that fetch's. Only
+        # action-bearing fetches take it; the action-less hot path never does.
+        self.download_lock = asyncio.Lock()
 
     def _download_prefs(self) -> dict:
         """Firefox prefs that save downloads straight to our dir with no prompt — the

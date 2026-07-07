@@ -258,10 +258,14 @@ class FetchClient:
         ok = False
         popups: list = []
         # Engines that can't use Playwright's download event (invisible Firefox) save
-        # files to disk instead. Snapshot the dir now so we can spot *this* fetch's new
-        # file after the actions run.
+        # files to disk instead, into one browser-global dir shared by every tab. We
+        # snapshot that dir just before running actions and diff after — but only while
+        # holding the engine's download_lock, so a concurrent fetch's download can't land
+        # in our diff and get misattributed (or deleted out from under it). The snapshot
+        # is taken below, inside the lock; the action-less hot path skips all of this.
         dl_dir = getattr(self._engine, "download_dir", None)
-        dl_before = set(os.listdir(dl_dir)) if dl_dir and os.path.isdir(dl_dir) else set()
+        dl_lock = getattr(self._engine, "download_lock", None)
+        dl_before: set = set()
 
         def _on_download(d: Download):
             nonlocal download_file
@@ -322,46 +326,61 @@ class FetchClient:
             except (asyncio.TimeoutError, Exception):
                 pass
 
-            # Run actions
-            if actions:
-                # Dismiss overlays again right before actions — some sites (Roche)
-                # re-show or delay their OneTrust modal until after initial load.
-                for _ in range(2):
-                    try:
-                        await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=4.0)
-                    except (asyncio.TimeoutError, Exception):
-                        pass
-                    await page.wait_for_timeout(300)
-
-                for act in actions:
-                    await self._run_action(page, act)
-                    # Check if a download was triggered
-                    if download_file:
-                        break
-                    # Human-like pause between actions
-                    await page.wait_for_timeout(random.randint(100, 400))
-
-            # If a download was triggered, read its content.
+            # Run actions + resolve any download they triggered. For disk-download
+            # engines (shared dir) this whole window is serialized on download_lock so
+            # the snapshot/diff can't collide with a concurrent fetch's download; the
+            # action-less path holds no lock and stays concurrent.
             download_filename = None
-            if download_file:
-                # Playwright download event (Chromium).
-                path = await download_file.path()
-                download_filename = download_file.suggested_filename
-                if path:
-                    download_url = download_file.url or url
-                    download_content = _read_download(path, download_filename, download_url)
-            elif dl_dir and actions:
-                # Disk-based capture (invisible Firefox): the file was saved to the
-                # download dir. Grab the new file, read it, then delete it so the dir
-                # doesn't accumulate and the next fetch's snapshot stays clean.
-                got = await self._collect_disk_download(dl_dir, dl_before)
-                if got:
-                    path, download_filename = got
-                    download_content = _read_download(path, download_filename, url)
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+            use_dl_lock = bool(dl_dir and dl_lock and actions)
+            if use_dl_lock:
+                await dl_lock.acquire()
+            try:
+                if actions:
+                    # Snapshot the shared download dir now (inside the lock) so anything
+                    # new after the actions is unambiguously this fetch's download.
+                    if dl_dir and os.path.isdir(dl_dir):
+                        dl_before = set(os.listdir(dl_dir))
+
+                    # Dismiss overlays again right before actions — some sites (Roche)
+                    # re-show or delay their OneTrust modal until after initial load.
+                    for _ in range(2):
+                        try:
+                            await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=4.0)
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+                        await page.wait_for_timeout(300)
+
+                    for act in actions:
+                        await self._run_action(page, act)
+                        # Check if a download was triggered
+                        if download_file:
+                            break
+                        # Human-like pause between actions
+                        await page.wait_for_timeout(random.randint(100, 400))
+
+                # If a download was triggered, read its content.
+                if download_file:
+                    # Playwright download event (Chromium).
+                    path = await download_file.path()
+                    download_filename = download_file.suggested_filename
+                    if path:
+                        download_url = download_file.url or url
+                        download_content = _read_download(path, download_filename, download_url)
+                elif dl_dir and actions:
+                    # Disk-based capture (invisible Firefox): the file was saved to the
+                    # download dir. Grab the new file, read it, then delete it so the dir
+                    # doesn't accumulate and the next fetch's snapshot stays clean.
+                    got = await self._collect_disk_download(dl_dir, dl_before)
+                    if got:
+                        path, download_filename = got
+                        download_content = _read_download(path, download_filename, url)
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+            finally:
+                if use_dl_lock:
+                    dl_lock.release()
 
             # Best-effort: a late client-side navigation (some SPAs) can destroy the
             # execution context right here; the title isn't worth failing the fetch.
