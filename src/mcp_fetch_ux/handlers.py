@@ -8,6 +8,7 @@ import time
 from urllib.parse import urlparse
 
 from fetch_ux import FetchClient
+from fetch_ux.grok import grok_fetch
 
 logger = logging.getLogger("mcp_fetch_ux")
 
@@ -98,10 +99,36 @@ async def shutdown_client():
 
 
 async def call_tool(name: str, arguments: dict) -> str:
-    if name != "read_webpage":
+    if name == "read_webpage":
+        return await handle_fetch(**arguments)
+    elif name == "read_blocked_webpage":
+        return await handle_blocked_fetch(**arguments)
+    else:
         raise ValueError(f"Unknown tool: {name}")
 
-    return await handle_fetch(**arguments)
+
+async def handle_blocked_fetch(url: str, prompt: str | None = None) -> str:
+    """Fetch a blocked URL through Grok's server-side web search."""
+    start = time.time()
+    try:
+        # xai-sdk streaming is blocking — keep it off the event loop
+        result = await asyncio.to_thread(grok_fetch, url, prompt)
+    except Exception as e:
+        elapsed = time.time() - start
+        logger.error(f"blocked_fetch url={url} failed after {elapsed:.1f}s: {e}")
+        return f"Error fetching {url} via Grok: {e}"
+    elapsed = time.time() - start
+
+    logger.info(
+        f"blocked_fetch url={url} tools={result.tool_count} "
+        f"cost=${result.cost:.4f} time={elapsed:.1f}s"
+    )
+
+    lines = [result.content, "", "─" * 60,
+             f"Fetched via Grok: {url} | Cost: ${result.cost:.4f}"]
+    if result.citations:
+        lines.append(f"Sources: {', '.join(result.citations)}")
+    return "\n".join(lines)
 
 
 async def handle_fetch(

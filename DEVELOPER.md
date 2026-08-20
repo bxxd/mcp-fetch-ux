@@ -178,12 +178,16 @@ This beats Cloudflare/Datadome/Kasada-class walls. It does **not** beat Google's
 ```bash
 # .env (dev)
 PORT=5017
+XAI_API_KEY=xai-...   # for read_blocked_webpage (Grok-backed fetch)
 
 # .env (prod)
 PORT=5007
+XAI_API_KEY=xai-...
 ```
 
-No API keys. No secrets.
+`XAI_API_KEY` is only touched by `read_blocked_webpage`; `read_webpage` runs
+keyless. Without the key, `read_blocked_webpage` returns an error and
+everything else works.
 
 ## Commands
 
