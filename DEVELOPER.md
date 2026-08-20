@@ -189,6 +189,24 @@ XAI_API_KEY=xai-...
 keyless. Without the key, `read_blocked_webpage` returns an error and
 everything else works.
 
+## Operations
+
+**Engine**: both envs pin `FETCH_UX_ENGINE=chrome` in `.env`. The invisible
+engine (the code default) cannot cold-start on this host — its stealth-Firefox
+asset (`firefox-7`) 404s from the upstream `feder-cr/invisible_playwright`
+release. Un-pinning requires the fork to host its own browser asset first.
+
+**Chrome install**: the chrome engine launches real Google Chrome
+(`channel="chrome"`, `/opt/google/chrome`), not Playwright's bundled Chromium.
+`make chrome` installs it system-wide.
+
+**Display**: Chrome runs headed (the stealth posture) and needs an X display.
+`make server` wraps the process in `xvfb-run -a`; the prod unit
+`idio-mcp-fetch-prod` carries `xvfb-run -a` in its ExecStart. If `read_webpage`
+errors with "Missing X server or $DISPLAY", look for an orphaned `Xvfb`
+process first — a stale display from a dead instance can make `xvfb-run`
+hand the new server no display at all. Kill the orphan and restart.
+
 ## Commands
 
 ```bash
