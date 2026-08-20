@@ -12,7 +12,7 @@ TOOLS = [
             "  2. To interact, pass actions from the response back in the actions parameter.\n"
             "  3. Chain calls to navigate multi-page workflows (search, paginate, download).\n"
             "  4. If response is truncated, call again with start_index to continue reading.\n"
-            "  5. Some sites block automated access (403/captcha) — not every page is fetchable.\n\n"
+            "  5. If the site blocks you (403/captcha/paywall), switch to read_blocked_webpage.\n\n"
             "RETURNS\n"
             "  Page text + list of discovered actions (buttons, links, forms).\n"
             "  File downloads (CSV, PDF, XLSX) return file content directly.\n\n"
@@ -75,5 +75,32 @@ TOOLS = [
             },
             "required": ["url"],
         },
-    }
+    },
+    {
+        "name": "read_blocked_webpage",
+        "description": (
+            "read_blocked_webpage - retrieve a URL that blocks read_webpage\n\n"
+            "USAGE\n"
+            "  Use when read_webpage returns 403, a captcha, or a paywall stub\n"
+            "  (Bloomberg, Seeking Alpha, Reddit). Fetches through Grok's\n"
+            "  server-side web search — slower and costs money per call, so try\n"
+            "  read_webpage first.\n\n"
+            "RETURNS\n"
+            "  Extracted content per your prompt, with source citations."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "URL to fetch. Optionally describe it, e.g. 'latest article from bloomberg.com'",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "What to extract. Default: full article with author, date, key arguments, data points, conclusions.",
+                },
+            },
+            "required": ["url"],
+        },
+    },
 ]
