@@ -22,8 +22,9 @@ __all__ = ["BrowserEngine", "BaseEngine", "make_engine"]
 @runtime_checkable
 class BrowserEngine(Protocol):
     """A warm browser the core can open pages on + the browser interactions that
-    differ by engine. Adapters own the lifecycle and clipboard read-back; shared
-    interactions (overlay dismissal, select+copy) live in BaseEngine."""
+    differ by engine. Adapters own the lifecycle and the clipboard read/write
+    primitives; shared interactions (overlay dismissal, select+copy, and the
+    sentinel-guarded capture built on them) live in BaseEngine."""
 
     name: str
 
@@ -53,10 +54,11 @@ class BrowserEngine(Protocol):
 
     async def capture_text(self, page) -> str:
         """Select-all + copy the rendered page (incl. Shadow DOM) and return the
-        text. The select/copy is shared (BaseEngine.select_all_and_copy); the
-        read-back is engine-specific — Chromium uses clipboard.readText()
-        (permission-granted), Firefox reads the X clipboard via xclip (its readText
-        is gated by user activation and in-page reads hit page CSP)."""
+        text, or "" if the copy provably did not land — never a previous page's
+        text. Implemented once in BaseEngine; adapters supply _write_clipboard /
+        _read_clipboard — Chromium uses the permission-granted Clipboard API,
+        Firefox shells out to xclip (its readText is gated by user activation and
+        in-page reads hit page CSP)."""
         ...
 
     async def stop(self) -> None:

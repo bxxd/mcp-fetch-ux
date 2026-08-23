@@ -8,9 +8,10 @@ import pytest
 
 from fetch_ux.client import _read_download, FetchClient, FetchResult
 from fetch_ux.engines import make_engine
+from fetch_ux.engines.base import BaseEngine
 from fetch_ux.engines.chrome import _chrome_args, ChromeEngine
 from mcp_fetch_ux.tools import TOOLS
-from mcp_fetch_ux.handlers import call_tool, _validate_url, UnsafeUrl
+from mcp_fetch_ux.handlers import call_tool, _validate_url, UnsafeUrl, _looks_blocked
 
 
 # --- _read_download ---
@@ -46,11 +47,10 @@ def test_read_download_no_url_no_curl_hint():
 # --- Tool schema ---
 
 def test_tool_schema_valid():
-    assert len(TOOLS) == 1
-    tool = TOOLS[0]
-    assert tool["name"] == "read_webpage"
-    assert "url" in tool["inputSchema"]["properties"]
-    assert "url" in tool["inputSchema"]["required"]
+    assert [t["name"] for t in TOOLS] == ["read_webpage", "read_blocked_webpage"]
+    for tool in TOOLS:
+        assert "url" in tool["inputSchema"]["properties"]
+        assert "url" in tool["inputSchema"]["required"]
 
 
 def test_tool_schema_has_all_params():
@@ -66,9 +66,7 @@ def test_tool_schema_has_all_params():
 
 def test_tool_schema_constructs_as_mcp_tool():
     from mcp.types import Tool
-    for t in TOOLS:
-        tool = Tool(**t)
-        assert tool.name == "read_webpage"
+    assert {Tool(**t).name for t in TOOLS} == {"read_webpage", "read_blocked_webpage"}
 
 
 # --- handlers.call_tool routing ---
@@ -255,7 +253,7 @@ def test_invisible_engine_exposes_download_lock():
     from fetch_ux.engines.invisible import InvisibleEngine
     e = InvisibleEngine()
     assert isinstance(e.download_lock, asyncio.Lock)
-    assert e.download_lock is not e._clip_lock
+    assert e.download_lock is not e._clipboard_lock
     assert e.download_lock is not e._create_lock
 
 
@@ -296,3 +294,189 @@ async def test_validate_url_rejects_unsafe(url):
 ])
 async def test_validate_url_allows_public_ip(url):
     assert await _validate_url(url) is None
+
+
+# --- clipboard capture: a failed copy must never yield the previous page's text ---
+#
+# The OS clipboard is one global buffer that outlives pages, contexts and fetches,
+# and nothing clears it. Before the sentinel, a Ctrl+C that didn't land left the
+# previous fetch's text there and capture_text returned it under the new page's
+# title — silently. These pin that shut.
+
+class _FakePage:
+    """Minimal Page stand-in: records keystrokes, never navigates."""
+
+    def __init__(self):
+        self.keys = []
+
+    class _KB:
+        def __init__(self, outer): self.outer = outer
+        async def press(self, key): self.outer.keys.append(key)
+
+    @property
+    def keyboard(self):
+        return self._KB(self)
+
+    async def wait_for_timeout(self, ms):
+        return
+
+
+class _ClipEngine(BaseEngine):
+    """Engine over a fake OS clipboard. `copy_works` toggles whether Ctrl+C lands."""
+
+    def __init__(self, buffer="", copy_works=True):
+        self.buffer = buffer          # survives across captures, like the real thing
+        self.copy_works = copy_works
+        self.page_text = "CURRENT PAGE TEXT"
+
+    async def _write_clipboard(self, page, text):
+        self.buffer = text
+
+    async def _read_clipboard(self, page):
+        return self.buffer
+
+    async def select_all_and_copy(self, page):
+        await super().select_all_and_copy(page)
+        if self.copy_works:
+            self.buffer = self.page_text
+
+
+@pytest.mark.asyncio
+async def test_capture_text_returns_page_text_when_copy_lands():
+    eng = _ClipEngine(buffer="PREVIOUS PAGE TEXT", copy_works=True)
+    assert await eng.capture_text(_FakePage()) == "CURRENT PAGE TEXT"
+
+
+@pytest.mark.asyncio
+async def test_capture_text_returns_empty_when_copy_silently_fails():
+    """The regression: clipboard still holds the prior fetch, Ctrl+C does nothing."""
+    eng = _ClipEngine(buffer="PREVIOUS PAGE TEXT", copy_works=False)
+    got = await eng.capture_text(_FakePage())
+    assert got == "", f"stale read leaked: {got!r}"
+    assert "PREVIOUS" not in got
+
+
+@pytest.mark.asyncio
+async def test_capture_text_returns_empty_when_read_raises():
+    """A navigation mid-capture destroys the execution context — Chrome's
+    page.evaluate raises. That's a failed capture, not a reason to guess."""
+    eng = _ClipEngine(buffer="PREVIOUS PAGE TEXT")
+
+    async def boom(page):
+        raise RuntimeError("Execution context was destroyed")
+    eng._read_clipboard = boom
+    assert await eng.capture_text(_FakePage()) == ""
+
+
+@pytest.mark.asyncio
+async def test_capture_text_returns_empty_when_baseline_write_fails():
+    """No sentinel written (e.g. xclip missing) → the read can't be trusted."""
+    eng = _ClipEngine(buffer="PREVIOUS PAGE TEXT")
+
+    async def boom(page, text):
+        raise FileNotFoundError("xclip")
+    eng._write_clipboard = boom
+    assert await eng.capture_text(_FakePage()) == ""
+
+
+@pytest.mark.asyncio
+async def test_capture_text_sentinel_is_not_leaked_as_content():
+    eng = _ClipEngine(copy_works=False)
+    assert BaseEngine._SENTINEL_PREFIX not in await eng.capture_text(_FakePage())
+
+
+@pytest.mark.asyncio
+async def test_capture_text_serializes_concurrent_captures():
+    """One OS clipboard per display: without the lock, two captures interleave and
+    each reads the other's text. The lock must hold across stamp→copy→read."""
+    eng = _ClipEngine()
+    inside = 0
+    overlapped = False
+    real_copy = eng.select_all_and_copy
+
+    async def watched(page):
+        nonlocal inside, overlapped
+        inside += 1
+        if inside > 1:
+            overlapped = True
+        await asyncio.sleep(0.01)
+        await real_copy(page)
+        inside -= 1
+    eng.select_all_and_copy = watched
+
+    await asyncio.gather(*(eng.capture_text(_FakePage()) for _ in range(4)))
+    assert not overlapped
+
+
+# --- DOM fallback: what makes congress.gov work again ---
+
+class _FallbackPage:
+    """Page whose clipboard path is dead but whose DOM reads fine."""
+
+    def __init__(self, dom_text="REAL PAGE BODY"):
+        self.dom_text = dom_text
+
+    def locator(self, sel):
+        assert sel == "body"
+        page = self
+
+        class _Loc:
+            async def inner_text(self, timeout=None):
+                return page.dom_text
+        return _Loc()
+
+
+class _DeadClipboardEngine:
+    async def capture_text(self, page):
+        return ""          # copy provably didn't land
+
+
+@pytest.mark.asyncio
+async def test_capture_falls_back_to_dom_when_clipboard_dead():
+    client = FetchClient(engine=_DeadClipboardEngine())
+    assert await client._capture(_FallbackPage()) == "REAL PAGE BODY"
+
+
+@pytest.mark.asyncio
+async def test_capture_prefers_clipboard_when_it_works():
+    """The DOM read misses closed Shadow DOM, so it stays the fallback, not the path."""
+    class _GoodEngine:
+        async def capture_text(self, page):
+            return "CLIPBOARD TEXT"
+    client = FetchClient(engine=_GoodEngine())
+    assert await client._capture(_FallbackPage()) == "CLIPBOARD TEXT"
+
+
+@pytest.mark.asyncio
+async def test_capture_returns_empty_when_both_paths_fail():
+    class _DeadPage:
+        def locator(self, sel):
+            raise RuntimeError("page closed")
+    client = FetchClient(engine=_DeadClipboardEngine())
+    assert await client._capture(_DeadPage()) == ""
+
+
+# --- bot-wall interstitials (SSRN's Cloudflare turnstile) ---
+
+@pytest.mark.parametrize("title,content", [
+    ("Just a moment...", "papers.ssrn.com\nPerforming security verification"),
+    ("", "Checking your browser before accessing the site"),
+    ("Attention Required! | Cloudflare", "blocked"),
+    ("Access", "Please enable JavaScript and cookies to continue"),
+])
+def test_looks_blocked_detects_interstitials(title, content):
+    assert _looks_blocked(title, content)
+
+
+@pytest.mark.parametrize("title,content", [
+    ("Text - H.R.9340 - 119th Congress", "To amend the Federal Power Act..."),
+    ("", ""),
+    ("A moment in history", "An article about a just cause and a moment of change."),
+])
+def test_looks_blocked_ignores_real_pages(title, content):
+    assert not _looks_blocked(title, content)
+
+
+def test_looks_blocked_only_probes_the_head_of_the_content():
+    """A page that merely quotes the phrase deep in its body isn't an interstitial."""
+    assert not _looks_blocked("Real Article", "x" * 3000 + "just a moment")

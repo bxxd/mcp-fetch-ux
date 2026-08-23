@@ -79,6 +79,26 @@ async def _validate_url(url: str) -> None:
         if _is_blocked_ip(ip_str):
             raise UnsafeUrl(f"disallowed address: {ip_str} (for host {host})")
 
+# Bot-protection interstitials served in place of the page. The browser engines
+# can't solve these (SSRN's Cloudflare turnstile does not clear on its own, however
+# long you wait), and the interstitial's own text is not the page — returning it as
+# if it were the article is the failure worth naming.
+_INTERSTITIAL_SIGNS = (
+    "just a moment",
+    "performing security verification",
+    "checking your browser",
+    "verifying you are human",
+    "enable javascript and cookies to continue",
+    "attention required! | cloudflare",
+    "please verify you are a human",
+)
+
+
+def _looks_blocked(title: str, content: str) -> bool:
+    probe = f"{title}\n{content[:2000]}".lower()
+    return any(sign in probe for sign in _INTERSTITIAL_SIGNS)
+
+
 # Shared client — browser launched once, reused across requests
 _client: FetchClient | None = None
 
@@ -168,6 +188,16 @@ async def handle_fetch(
         f"length={result.length} truncated={result.truncated} "
         f"time={elapsed:.1f}s"
     )
+
+    if _looks_blocked(result.title, result.content):
+        logger.info(f"fetch url={url} blocked by interstitial title={result.title!r}")
+        return (
+            f"Blocked fetching {url} — a bot-protection interstitial was served "
+            f"instead of the page (HTTP {result.status}, title {result.title!r}).\n\n"
+            f"The browser engine cannot clear this challenge. Retry with "
+            f"read_blocked_webpage(url=...), which routes through Grok's server-side "
+            f"fetch and is not subject to this wall."
+        )
 
     if result.status >= 400:
         return f"HTTP {result.status} fetching {url}\n\n{result.content}"

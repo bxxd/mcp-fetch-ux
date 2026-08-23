@@ -59,8 +59,9 @@ Dismiss cookie/consent overlays
 Human-like pause (200-600ms random)
     │
     ▼
-Poll: engine.capture_text()  [select-all + copy, then engine-specific read-back]
+Poll: client._capture()  [clipboard capture; DOM inner_text if the copy didn't land]
     │  400-600ms jittered intervals, stable after 2 consecutive equal readings
+    │  Empty never counts as stable — an unrendered page isn't a settled one
     │  Max 12 iterations (~6s)
     │
     ▼
@@ -87,9 +88,20 @@ Return text + available actions + pagination
 - Wikipedia (static HTML) — gets full article
 - GitHub (React SPA) — gets full README
 
-**Reading the clipboard back is engine-specific** — that's the crux of why this is a port (`engine.capture_text()`):
+**Reading the clipboard back is engine-specific** — that's the crux of why this is a port (`engine._read_clipboard()`):
 - **chrome**: `navigator.clipboard.readText()` — Chromium honors the context's `clipboard-read` permission grant.
-- **invisible (Firefox)**: reads the X11 clipboard out-of-process with `xclip`. Reading it back *inside the page* (the obvious route — `readText()`, or pasting into a `<textarea>` and reading `.value`) goes through `page.evaluate`, which runs in Firefox's main world and is **blocked by strict site CSP** (`script-src` without `unsafe-eval` — Hacker News always, Roche intermittently): it throws `call to eval() blocked by CSP` or hangs the whole fetch to timeout. A subprocess reading the OS clipboard never touches the page, so CSP can't reach it. The copy+read is serialized (`_clip_lock`) — one global clipboard per display.
+- **invisible (Firefox)**: reads the X11 clipboard out-of-process with `xclip`. Reading it back *inside the page* (the obvious route — `readText()`, or pasting into a `<textarea>` and reading `.value`) goes through `page.evaluate`, which runs in Firefox's main world and is **blocked by strict site CSP** (`script-src` without `unsafe-eval` — Hacker News always, Roche intermittently): it throws `call to eval() blocked by CSP` or hangs the whole fetch to timeout. A subprocess reading the OS clipboard never touches the page, so CSP can't reach it.
+
+### The stale-clipboard trap
+
+A failed Ctrl+C is **silent**. The OS clipboard is one buffer per display that outlives pages, contexts and fetches, and nothing clears it — so reading it back after a copy that didn't land returns *the previous fetch's text*, under the current page's title, with no error anywhere. This shipped as a live bug: congress.gov bill pages (a JS app that navigates after first paint) defeat Ctrl+A/Ctrl+C every time, so three fetches in one session returned the body of the page fetched before them.
+
+Two guards, both in `BaseEngine.capture_text`:
+
+1. **Sentinel** — a unique token is stamped on the clipboard before every copy. If it survives, the copy didn't land and capture returns `""`, never a stale buffer. Any exception in the window (a navigation destroying the execution context — Chrome's `page.evaluate` raises *"Execution context was destroyed"*) is the same answer.
+2. **Lock** (`_clipboard_lock`) — serializes stamp→copy→read. The clipboard is **not** isolated per browser context; without this, two concurrent captures read each other's page text (reproduced 6/6 before the lock).
+
+`""` is not the end of the road: `FetchClient._capture` then reads `body.inner_text()`. That misses closed Shadow DOM, which is why it's the fallback and not the path — but it belongs to the page actually loaded, and it is what makes congress.gov work.
 
 ### Why poll for stability
 
@@ -103,7 +115,7 @@ Both engines keep state warm across fetches:
 - **invisible**: one Firefox with one shared context, created once at `start()`; each fetch opens a *tab* (`context.new_page`). Fresh coherent fingerprint per `start()`/recycle. Opening a target in this Firefox intermittently deadlocks (~7.5% under heavy churn) — a healthy creation returns in <0.7s, a bad one hangs forever — so `new_page()` bounds each attempt at 6s and retries; the retry returns in ~0.5s.
 - **chrome**: one persistent context = a warm, **shared** cookie jar (cookies shared across fetches — fine for public pages; the recycle TTL bounds it).
 
-Concurrent fetches are gated by an `asyncio.Semaphore` sized from `engine.concurrency`: **invisible = 1** (a single Firefox can't safely create targets in parallel, and the read-back rides one global clipboard), **chrome = 3** (Chromium isolates per context).
+Concurrent fetches are gated by an `asyncio.Semaphore` sized from `engine.concurrency`: **invisible = 3** (an on-demand pool of reused tabs; only tab *creation* is serialized), **chrome = 3** (one shared persistent context; page work parallelizes safely). Neither number covers the clipboard — that is a single OS resource for the whole display, guarded separately by `_clipboard_lock`.
 
 ### Actions
 

@@ -205,6 +205,23 @@ class FetchClient:
             except asyncio.TimeoutError:
                 raise TimeoutError(f"Timed out after {self.timeout_ms // 1000}s fetching {url}")
 
+    async def _capture(self, page) -> str:
+        """Page text: clipboard first, DOM read as the fallback.
+
+        The engine returns "" when the Ctrl+C provably did not land — a mid-capture
+        navigation, an unselectable page, or a destroyed execution context. That is a
+        routine condition on JS-app sites (congress.gov defeats Ctrl+A/Ctrl+C on every
+        bill page), so fall back to reading the rendered DOM. It misses closed Shadow
+        DOM, which is why it isn't the primary path, but it needs no clipboard and no
+        page-world JS, and it always belongs to the page actually loaded."""
+        text = await self._engine.capture_text(page)
+        if text.strip():
+            return text
+        try:
+            return await page.locator("body").inner_text(timeout=8000)
+        except Exception:
+            return ""
+
     async def _goto(self, page, url: str):
         """Navigate, retrying once on a transient 'interrupted by another navigation'.
         A freshly opened tab can fire an internal about:blank/about:newtab navigation
@@ -301,11 +318,21 @@ class FetchClient:
             poll_start = asyncio.get_running_loop().time()
             for i in range(12):
                 await page.wait_for_timeout(random.randint(400, 600))
-                text = await self._engine.capture_text(page)
+                text = await self._capture(page)
                 cur_len = len(text)
-                # Stable = <0.5% change (dynamic ads/counters jitter slightly)
+                # Stable = <0.5% change (dynamic ads/counters jitter slightly).
+                # Safe against a stale buffer now: a failed copy yields "" from
+                # _capture's clipboard leg, not a repeat of the previous fetch's
+                # text, so "unchanging" can no longer mean "unchanged since the last
+                # URL".
                 delta = abs(cur_len - prev_len) / max(cur_len, 1)
-                if delta < 0.005 and i >= 2:
+                # `cur_len > 0`: an empty capture is not a settled page. Zero-length
+                # reads compare equal to each other, so without this a page that
+                # hasn't rendered yet looks maximally "stable" and we give up after
+                # ~2s. (Before the sentinel this never showed: a failed copy returned
+                # the previous fetch's text, which was non-empty and looked stable
+                # for the same wrong reason.)
+                if cur_len > 0 and delta < 0.005 and i >= 2:
                     stable_count += 1
                     if stable_count >= 2:
                         break
@@ -322,7 +349,7 @@ class FetchClient:
             try:
                 if await asyncio.wait_for(self._engine.dismiss_overlays(page), timeout=3.0):
                     await page.wait_for_timeout(300)
-                    text = await self._engine.capture_text(page)
+                    text = await self._capture(page)
             except (asyncio.TimeoutError, Exception):
                 pass
 
@@ -396,7 +423,7 @@ class FetchClient:
             else:
                 # Re-capture clipboard after actions (content may have changed)
                 if actions:
-                    text = await self._engine.capture_text(page)
+                    text = await self._capture(page)
                 content = text
 
             # Discover available actions on the page

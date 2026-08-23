@@ -63,10 +63,6 @@ class InvisibleEngine(BaseEngine):
         # deadlock. Operating existing tabs in parallel is fine, so release never takes
         # this lock (a finished fetch returns its tab without waiting on a creation).
         self._create_lock = asyncio.Lock()
-        # The X11 clipboard is ONE global resource per display. Ctrl+C → xclip-read
-        # must not interleave across concurrent pages, or one fetch reads another's
-        # copied text. Serialize just that critical section (not the whole fetch).
-        self._clip_lock = asyncio.Lock()
         # Downloads land here on disk (this Firefox can't fire Playwright's download
         # event). The core reads new files from this dir and deletes them after. One
         # dir per engine; Firefox's download.dir is browser-global so the pool shares it.
@@ -174,46 +170,42 @@ class InvisibleEngine(BaseEngine):
                 await asyncio.sleep(0.25)
         raise last_exc  # all attempts failed — surface as a normal fetch error
 
-    async def capture_text(self, page) -> str:
-        """Read rendered text (incl. closed Shadow DOM) back via the OS clipboard.
+    async def _focus_document(self, page) -> None:
+        """Firefox's Ctrl+A only selects when the *document* has focus, and a fresh
+        tab leaves focus on the URL bar (or nothing) until the user clicks. Click the
+        (1,1) pixel — exactly what a user does before pressing Ctrl+A. (1,1) is inside
+        the html element's edge, well outside any normal interactive region. Without
+        this, sites that don't autofocus content (Reddit shreddit) silently returned
+        an empty clipboard. Idempotent on repeat captures (same caret position)."""
+        try:
+            await page.mouse.click(1, 1)
+        except Exception:
+            pass
 
-        Ctrl+A/Ctrl+C puts the selection on the X11 clipboard; we read it with
-        `xclip`. Select-then-copy is what reaches closed shadow roots that
-        `innerText` / `locator.inner_text()` can't see (Roche pipeline, etc.).
-        Subprocess clipboard read is CSP-proof — page-world JS can't reach it,
-        so strict-CSP sites (Reddit, HN, Roche intermittently) work.
+    # Clipboard I/O goes through xclip subprocesses, not page JS: CSP-proof (page-world
+    # script can't reach it) and independent of the page's execution context, so
+    # strict-CSP sites (Reddit, HN, Roche intermittently) work. Select-then-copy is
+    # also what reaches closed shadow roots that innerText can't see.
+    async def _write_clipboard(self, page, text: str) -> None:
+        """Own the CLIPBOARD selection with `text` — the sentinel baseline. Raises if
+        xclip is missing, which BaseEngine.capture_text turns into "no capture" so a
+        host without xclip degrades to the DOM read instead of serving stale text."""
+        proc = await asyncio.create_subprocess_exec(
+            "xclip", "-selection", "clipboard",
+            stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.communicate(text.encode()), timeout=5.0)
 
-        Firefox's Ctrl+A only selects when the *document* has focus, and a fresh
-        tab leaves focus on the URL bar (or nothing) until the user clicks. So
-        we click the (1,1) pixel first — exactly what a user does when they
-        click on the page before pressing Ctrl+A. (1,1) is inside the html
-        element's edge, well outside any normal interactive region. Without
-        this click, sites that don't autofocus content (Reddit shreddit) silently
-        returned an empty clipboard — the bug this fixes.
-
-        Pure user input throughout: a mouse click and two keystrokes. No
-        page.evaluate, no JS-side focus(), nothing CSP could block.
-        """
-        async with self._clip_lock:
-            # User-equivalent focus: a click on the page so Ctrl+A has a document
-            # to select in. Cheap, idempotent on repeat captures (the polling loop
-            # calls this up to 12 times per fetch — same caret position each time).
-            try:
-                await page.mouse.click(1, 1)
-            except Exception:
-                pass
-            await self.select_all_and_copy(page)
-            # Tiny settle: Firefox sets the X CLIPBOARD selection owner just after
-            # the Ctrl+C keystroke is processed; reading instantly can race it.
-            await page.wait_for_timeout(60)
-            return await self._read_x_clipboard()
+    async def _read_clipboard(self, page) -> str:
+        return await self._read_x_clipboard()
 
     @staticmethod
     async def _read_x_clipboard() -> str:
         """Read the X11 CLIPBOARD selection via xclip. The worker runs headed under
         xvfb, so DISPLAY is set and inherited by the subprocess. Returns "" on any
-        failure — the caller's stability loop re-captures, so a transient miss is
-        self-healing rather than fatal."""
+        failure; "" never matches the sentinel, so the caller falls back to the DOM
+        read rather than trusting a buffer it could not read."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "xclip", "-selection", "clipboard", "-o",
