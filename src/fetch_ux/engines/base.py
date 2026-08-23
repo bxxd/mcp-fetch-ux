@@ -1,8 +1,10 @@
 """Shared engine behavior — the browser interactions that don't depend on which
 browser. Adapters subclass this and add the lifecycle (start/new_page/stop) plus
-the engine-specific clipboard read-back (capture_text)."""
+the engine-specific clipboard primitives (_write_clipboard/_read_clipboard); the
+sentinel-guarded capture built on them is shared here."""
 
 import asyncio
+import uuid
 
 
 class BaseEngine:
@@ -72,9 +74,68 @@ class BaseEngine:
         """Select the whole rendered page and copy it to the OS clipboard — the
         step that captures Shadow-DOM text (including closed roots) that
         innerText/Readability miss. Reading it back is engine-specific
-        (see `capture_text`)."""
+        (see `_read_clipboard`)."""
         await page.keyboard.press("Control+a")
         await page.keyboard.press("Control+c")
+
+    # --- clipboard capture (shared; engines supply the read/write primitives) ---
+
+    # A failed Ctrl+C is silent. The OS clipboard keeps whatever the last successful
+    # copy put there, so reading it back after a failed copy yields the PREVIOUS
+    # page's text — under the current page's title, with no error anywhere. We make
+    # that detectable by stamping a unique sentinel on the clipboard before every
+    # copy: if the sentinel survives, the copy did not land.
+    _SENTINEL_PREFIX = "fetchux-uncopied-"
+
+    @property
+    def _clipboard_lock(self) -> asyncio.Lock:
+        """Serializes the stamp→copy→read window. The OS clipboard is ONE buffer per
+        display — shared by every tab, page and browser context — so two captures
+        running at once read each other's text. Lazily built so engines need no
+        cooperating __init__."""
+        lock = self.__dict__.get("_clipboard_lock_obj")
+        if lock is None:
+            lock = self.__dict__["_clipboard_lock_obj"] = asyncio.Lock()
+        return lock
+
+    async def _write_clipboard(self, page, text: str) -> None:
+        """Put `text` on the OS clipboard. Engine-specific."""
+        raise NotImplementedError
+
+    async def _read_clipboard(self, page) -> str:
+        """Read the OS clipboard back. Engine-specific."""
+        raise NotImplementedError
+
+    async def _focus_document(self, page) -> None:
+        """Give the document focus so Ctrl+A has something to select. No-op by
+        default; engines whose browser leaves focus off the document override it."""
+        return
+
+    async def capture_text(self, page) -> str:
+        """Rendered page text (incl. closed Shadow DOM), read back via the clipboard.
+
+        Returns "" when the copy provably did not land — never the previous fetch's
+        text. Callers treat "" as "the clipboard path is unavailable here" and fall
+        back to a DOM read (see FetchClient._capture)."""
+        async with self._clipboard_lock:
+            token = self._SENTINEL_PREFIX + uuid.uuid4().hex
+            try:
+                await self._write_clipboard(page, token)
+            except Exception:
+                # No baseline → a read can't be told apart from a stale one.
+                return ""
+            try:
+                await self._focus_document(page)
+                await self.select_all_and_copy(page)
+                # The browser takes clipboard ownership just after the keystroke is
+                # processed; reading instantly can race it.
+                await page.wait_for_timeout(60)
+                text = await self._read_clipboard(page)
+            except Exception:
+                # A navigation mid-capture destroys the execution context. That is a
+                # failed capture, not a reason to hand back a stale buffer.
+                return ""
+            return "" if text.strip() == token else text
 
     # --- per-fetch page lifecycle (engines that pool/reuse pages override these) ---
 

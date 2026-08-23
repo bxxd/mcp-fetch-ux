@@ -38,9 +38,11 @@ def _chrome_args() -> list[str]:
 class ChromeEngine(BaseEngine):
     name = "chrome"
 
-    # Chromium isolates each fetch in its own browser context and reads the clipboard
-    # via a per-context permission grant (no global-clipboard or shared-target-creation
-    # hazard), so it runs several fetches at once safely.
+    # Several fetches at once is safe for page work: no shared-target-creation hazard
+    # here. The clipboard is NOT isolated per browser context though — it is one OS
+    # buffer for the whole display, and this engine runs a single shared persistent
+    # context regardless. BaseEngine.capture_text serializes the clipboard window;
+    # without that lock, concurrent captures read each other's page text.
     concurrency = 3
 
     def __init__(self, timeout_ms: int = 60_000, headless: bool | None = None):
@@ -89,10 +91,14 @@ class ChromeEngine(BaseEngine):
             pass
         return page
 
-    async def capture_text(self, page) -> str:
-        await self.select_all_and_copy(page)
-        # Chromium honors the context's clipboard-read permission grant, so the
-        # async readText API is reliable here.
+    # Chromium honors the context's clipboard-read/write permission grant, so the
+    # async Clipboard API is the natural primitive here. Both calls run in the page's
+    # execution context: a navigation mid-capture makes them throw, which
+    # BaseEngine.capture_text turns into "no capture" rather than a stale read.
+    async def _write_clipboard(self, page, text: str) -> None:
+        await page.evaluate("t => navigator.clipboard.writeText(t)", text)
+
+    async def _read_clipboard(self, page) -> str:
         return await page.evaluate("navigator.clipboard.readText()")
 
     async def stop(self) -> None:
