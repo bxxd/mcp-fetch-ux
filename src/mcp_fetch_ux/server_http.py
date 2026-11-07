@@ -80,8 +80,12 @@ async def handle_sse(request: Request) -> Response:
     async with sse.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
+        # stateless: a client whose SSE stream reconnects after a server restart
+        # opens a new session without repeating initialize, and a stateful session
+        # rejects every call on it until the agent reconnects by hand.
         await mcp_server.run(
-            streams[0], streams[1], mcp_server.create_initialization_options()
+            streams[0], streams[1], mcp_server.create_initialization_options(),
+            stateless=True,
         )
     return Response()
 
